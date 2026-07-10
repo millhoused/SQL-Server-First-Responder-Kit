@@ -10537,8 +10537,8 @@ IF NOT EXISTS ( SELECT  1
 																   END
 																   + CASE WHEN r.Finding <> COALESCE(rPrior.Finding,N'') AND r.Finding <> COALESCE(rNext.Finding,N'') THEN N'- ' + COALESCE(r.Finding,N'') + N' ' + COALESCE(r.DatabaseName, N'') + N' - ' + COALESCE(r.Details,N'') + @crlf
 																	      WHEN r.Finding <> COALESCE(rPrior.Finding,N'') AND r.Finding = rNext.Finding AND r.Details = rNext.Details THEN N'- ' + COALESCE(r.Finding,N'') + N' - ' + COALESCE(r.Details,N'') + @crlf + @crlf + N'    * ' + COALESCE(r.DatabaseName, N'') + @crlf
-																	      WHEN r.Finding <> COALESCE(rPrior.Finding,N'') AND r.Finding = rNext.Finding THEN N'- ' + COALESCE(r.Finding,N'') + @crlf + @crlf + CASE WHEN r.DatabaseName IS NULL THEN N'' ELSE  N'    * ' + COALESCE(r.DatabaseName,N'') END + CASE WHEN r.Details <> rPrior.Details THEN N'  - ' + COALESCE(r.Details,N'') + @crlf ELSE '' END
-																	      ELSE CASE WHEN r.DatabaseName IS NULL THEN N'' ELSE  N'    * ' + COALESCE(r.DatabaseName,N'') END + CASE WHEN r.Details <> rPrior.Details THEN N'  - ' + COALESCE(r.Details,N'') + @crlf ELSE N'' + @crlf END
+																	      WHEN r.Finding <> COALESCE(rPrior.Finding,N'') AND r.Finding = rNext.Finding THEN N'- ' + COALESCE(r.Finding,N'') + @crlf + @crlf + CASE WHEN r.DatabaseName IS NULL THEN N'' ELSE  N'    * ' + COALESCE(r.DatabaseName,N'') END + CASE WHEN COALESCE(r.Details, N'') <> COALESCE(rPrior.Details, N'') THEN N'  - ' + COALESCE(r.Details,N'') + @crlf ELSE '' END
+																	      ELSE CASE WHEN r.DatabaseName IS NULL THEN N'' ELSE  N'    * ' + COALESCE(r.DatabaseName,N'') END + CASE WHEN COALESCE(r.Details, N'') <> COALESCE(rPrior.Details, N'') THEN N'  - ' + COALESCE(r.Details,N'') + @crlf ELSE N'' + @crlf END
 																   END + @crlf
 															     FROM Results r
 															     LEFT OUTER JOIN Results rPrior ON r.rownum = rPrior.rownum + 1
