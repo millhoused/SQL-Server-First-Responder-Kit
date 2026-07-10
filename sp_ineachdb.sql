@@ -30,7 +30,8 @@ ALTER PROCEDURE [dbo].[sp_ineachdb]
   @VersionDate          datetime       = NULL OUTPUT,
   @VersionCheckMode     bit            = 0,
   @is_ag_writeable_copy bit            = 0,
-  @is_query_store_on	bit            = NULL
+  @is_query_store_on	bit            = NULL,
+  @database_order       nvarchar(10)   = NULL -- DEFAULT = ID order, NAME = alphabetical order
 -- WITH EXECUTE AS OWNER – maybe not a great idea, depending on the security of your system
 AS
 BEGIN
@@ -354,7 +355,10 @@ END
   -- ok, now, let's go through what we have left
   DECLARE dbs CURSOR LOCAL FAST_FORWARD
     FOR SELECT DB_NAME(id), QUOTENAME(DB_NAME(id))
-    FROM #ineachdb;
+    FROM #ineachdb
+	ORDER BY
+		CASE @database_order WHEN N'NAME' THEN name END ASC -- fall back to ID order
+		, id ASC;
 
   OPEN dbs;
 
