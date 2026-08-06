@@ -28,6 +28,9 @@ Navigation
  - Backups and Restores:
    - [sp_BlitzBackups: How Much Data Could You Lose](#sp_blitzbackups-how-much-data-could-you-lose)  
    - [sp_DatabaseRestore: Easier Multi-File Restores](#sp_databaserestore-easier-multi-file-restores)  
+ - Other Utilities:
+   - [sp_ineachdb: Run a Command in Each Database](#sp_ineachdb-run-a-command-in-each-database)
+   - [sp_BlitzUpdate: Update the First Responder Kit from GitHub](#sp_blitzupdate-update-the-first-responder-kit-from-github)
  - [Parameters Common to Many of the Stored Procedures](#parameters-common-to-many-of-the-stored-procedures)
  - [License MIT](#license)
 
@@ -778,7 +781,12 @@ Useful parameters:
 * `@database_list`, `@exclude_list` - comma-separated lists of databases to include or exclude. Bracket-quote names that contain special characters.
 * `@name_pattern`, `@exclude_pattern` - LIKE patterns applied to database names.
 * `@system_only`, `@user_only` - limit to system DBs (master/model/msdb/tempdb/distribution) or user DBs.
-* `@recovery_model_desc`, `@compatibility_level`, `@is_read_only`, `@is_auto_close_on`, `@is_auto_shrink_on`, `@is_broker_enabled`, `@is_query_store_on`, `@user_access`, `@state_desc` - filter by database property.
+* `@is_read_only` - **defaults to 0, which skips read-only databases.** This one surprises people, so read carefully:
+  * `0` (the default) - only databases that are *not* read-only. This is the safe default because most commands you'd run in each database make writeable changes, and those would fail in a read-only database.
+  * `1` - only read-only databases.
+  * `NULL` - all databases, read-only or not. Pass this when you want a truly server-wide pass and your command is read-only, like `SELECT`s or `DBCC CHECKDB`.
+* `@state_desc` - defaults to `N'ONLINE'`, so offline, restoring, and recovering databases are skipped too. Pass `NULL` for all states.
+* `@recovery_model_desc`, `@compatibility_level`, `@is_auto_close_on`, `@is_auto_shrink_on`, `@is_broker_enabled`, `@is_query_store_on`, `@user_access` - filter by database property. These all default to `NULL`, meaning no filtering.
 * `@is_ag_writeable_copy = 1` - skip Availability Group secondaries.
 * `@print_dbname`, `@print_command`, `@print_command_only`, `@select_dbname` - diagnostics for debugging your command string without running it.
 
@@ -800,6 +808,65 @@ This means callers that already work with `sp_MSforeachdb` on box SQL (like `sp_
 * **Non-canonical whitespace isn't matched.** `USE  [?];` (double space) or `[?] . sys . tables` (spaces between name parts) won't be rewritten. Stick to the canonical `USE [?];` and `[?].sys.tables` forms.
 * **Managed Instance is not affected.** Azure SQL Managed Instance reports `EngineEdition = 8` and supports cross-database calls, so it uses the same code path as box SQL.
 * **Filter parameters still apply** - the current database is added to the list, then the usual `@name_pattern`, `@user_only`, property filters, etc. can still exclude it. If nothing matches, you get the normal `No databases to process.` message.
+
+[*Back to top*](#header1)
+
+
+
+## sp_BlitzUpdate: Update the First Responder Kit from GitHub
+
+`sp_BlitzUpdate` downloads a First Responder Kit file straight from GitHub and installs it in the current database, without sqlcmd, PowerShell, or RDP. It's for lab and dev servers you want to keep current with one command:
+
+```tsql
+USE master;
+GO
+EXEC dbo.sp_BlitzUpdate;
+```
+
+That grabs `Install-All-Scripts.sql` from the `main` branch and runs it, batch by batch.
+
+> **Installation:** sp_BlitzUpdate ships in the `OptionalScripts` folder and is **not** included in `Install-All-Scripts.sql` or `Install-Azure.sql`. Open `OptionalScripts/sp_BlitzUpdate.sql` in SSMS, switch to the database where you want it installed (typically `master`), and run it once. After that, call it whenever you want a refresh.
+
+### Requirements
+
+* **SQL Server 2025 or Azure SQL DB.** It's built on `sys.sp_invoke_external_rest_endpoint`, which doesn't exist in earlier versions. The script refuses to install on older builds, and the proc raises an error at runtime if it somehow got installed anyway.
+* On boxed SQL Server: `sp_configure 'external rest endpoint enabled', 1; RECONFIGURE;`
+* Outbound HTTPS to api.github.com on TCP 443. On Azure SQL DB, api.github.com has to be on the server's outbound REST allowlist (set in the Azure portal or via ARM at the server level), or you'll get `Msg 31612: Connections to the domain api.github.com are not allowed.`
+* The current database needs compatibility level 130 or higher, because the GitHub API payload is read with OPENJSON. SQL Server 2025 defaults to 170, so this only bites if you've manually downgraded a database.
+* CREATE/ALTER PROCEDURE rights in the target database, plus EXECUTE on `sys.sp_invoke_external_rest_endpoint`.
+
+### Parameters
+
+| Parameter | Type | Default | Purpose |
+|---|---|---|---|
+| `@Branch` | `NVARCHAR(128)` | `N'main'` | Branch or tag to pull from. Date-based release tags work too, like `N'20260407'`. |
+| `@Repository` | `NVARCHAR(128)` | `N'BrentOzarULTD/SQL-Server-First-Responder-Kit'` | `owner/repo` on GitHub. Point it at your fork if you maintain one. |
+| `@FileName` | `NVARCHAR(256)` | `N'Install-All-Scripts.sql'` | Path to the file inside the repo. Pass `N'sp_Blitz.sql'` (etc.) to update one proc at a time. |
+| `@WhatIf` | `BIT` | `0` | `1` fetches and parses the file, prints how many batches *would* run, and exits without installing anything. |
+| `@Debug` | `TINYINT` | `0` | `1` prints per-batch length and progress. |
+| `@Help` | `TINYINT` | `0` | `1` prints usage info and returns. |
+
+### Examples
+
+```tsql
+/* Pinned to a release tag, which is what you want for reproducible lab boxes: */
+EXEC dbo.sp_BlitzUpdate @Branch = N'20260407';
+
+/* Update a single proc: */
+EXEC dbo.sp_BlitzUpdate @FileName = N'sp_Blitz.sql';
+
+/* Preview without installing: */
+EXEC dbo.sp_BlitzUpdate @WhatIf = 1, @Debug = 1;
+
+/* From a fork: */
+EXEC dbo.sp_BlitzUpdate @Repository = N'yourname/SQL-Server-First-Responder-Kit', @Branch = N'dev';
+```
+
+### Things to look out for
+
+* **This executes whatever GitHub serves at the ref you ask for.** Anyone with write access to that branch of that repo can run code on your server. That's why it's a lab tool, and why you should pass a release tag to `@Branch` instead of leaving it on `main` when you care about what you're getting.
+* Run it from the database you want the procs installed into. Most people want `USE master;` first, matching the regular FRK install workflow.
+* GitHub's anonymous API rate limit is 60 requests per hour per source IP, and each call uses one or two requests. Plenty of headroom for routine lab use.
 
 [*Back to top*](#header1)
 
