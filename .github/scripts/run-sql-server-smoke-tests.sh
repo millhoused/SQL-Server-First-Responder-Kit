@@ -10,7 +10,7 @@
 # did exactly that.
 #
 # Two outcomes, deliberately different (issue #4046, decision 1A):
-#   * A SQL error that the base branch does not also produce FAILS the build.
+#   * A SQL error this branch introduces FAILS the build.
 #   * A difference in sp_Blitz's findings is PRINTED for a human and does not
 #     fail the build, because changing a finding is often the point of the PR.
 #
@@ -47,12 +47,18 @@ KIT_SCRIPTS=(
   "OptionalScripts/sp_BlitzPlanCompare.sql"
 )
 
+# -I turns QUOTED_IDENTIFIER ON. sqlcmd defaults it OFF, and a procedure
+# captures the setting in force when it is created, so without this the
+# sp_BlitzFirst and sp_BlitzLock code paths that build indexed/XML expressions
+# die at runtime with Msg 1934. Every real client (SSMS, .NET, ODBC) has it ON,
+# so OFF was testing a configuration no user actually runs.
 SQLCMD_ARGS=(
   -S "$SQLCMDSERVER"
   -U "$SQLCMDUSER"
   -P "$SQLCMDPASSWORD"
   -C
   -b
+  -I
   -r 1
   -l 60
   -t 600
@@ -85,6 +91,34 @@ wait_for_sql_server() {
 
     sleep 2
   done
+}
+
+# ---------------------------------------------------------------------------
+# Hold off until the instance has been up longer than a minute.
+#
+# sp_Blitz CheckID 152 divides by @MsSinceWaitsCleared, which is
+# DATEDIFF(MINUTE, create_date, CURRENT_TIMESTAMP) * 60000.0 and is therefore 0
+# for the instance's first minute. Its zero-guard sits inside a branch that
+# cannot be taken while the value is 0, so sp_Blitz aborts with a divide-by-zero
+# -- see issue #4048, which tracks the fix.
+#
+# That is a real bug, but it is not one this comparison can measure: it depends
+# on how long the container took to start, so it fires on whichever pass happens
+# to run first and shows up as a spurious base-vs-head difference. Waiting the
+# window out keeps the two passes comparable. Remove this once #4048 is fixed.
+# ---------------------------------------------------------------------------
+wait_for_wait_stats() {
+  echo "Waiting for the instance to pass one minute of uptime (issue #4048)..."
+  for attempt in {1..40}; do
+    if [[ "$(run_query "SET NOCOUNT ON;
+SELECT DATEDIFF(MINUTE, create_date, CURRENT_TIMESTAMP)
+FROM sys.databases WHERE name = 'tempdb';" -h -1 -W 2>/dev/null | head -1 | tr -d '[:space:]')" != "0" ]]; then
+      echo "Uptime window cleared."
+      return 0
+    fi
+    sleep 5
+  done
+  echo "::warning::Instance still reports under a minute of uptime; continuing anyway."
 }
 
 # ---------------------------------------------------------------------------
@@ -122,18 +156,38 @@ install_kit() {
 }
 
 # ---------------------------------------------------------------------------
+# Reduce a step's output to a stable error signature.
+#
+# Comparing failure *labels* alone would turn every step that fails on base into
+# a permanent allowlist entry: a PR could introduce a completely different error
+# inside that step and stay green. Comparing the diagnostics instead means only
+# the identical error is treated as pre-existing.
+#
+# Server name and line numbers are stripped -- the container's hostname is random
+# per run, and a line number shifting is exactly the kind of change a PR makes
+# without changing the error itself.
+# ---------------------------------------------------------------------------
+error_signature() {
+  grep -oE '^(Msg [0-9]+, Level [0-9]+, State [0-9]+|Sqlcmd: Error)[^,]*' "$1" 2>/dev/null \
+    | sed -E 's/, Server [^,]+//; s/, (Procedure|Line) [^,]*//g' \
+    | sort -u \
+    | tr '\n' ';' \
+    || true
+}
+
+# ---------------------------------------------------------------------------
 # Split the matrix on --#STEP: markers and run each step on its own.
 #
 # Each step runs separately so one failure is attributed to one labelled step
 # and the rest of the matrix still runs -- we want every problem in a single CI
 # round, not just the first.
 #
-# Writes one "<status>\t<label>" line per step to the named results file.
+# Writes "<status><TAB><label><TAB><error signature>" per step.
 # ---------------------------------------------------------------------------
 run_matrix() {
   local label="$1" results_file="$2"
   local steps_dir="$WORK_DIR/steps-$label"
-  local step_file current_label failures=0
+  local step_file current_label failures=0 signature
 
   rm -rf "$steps_dir"
   mkdir -p "$steps_dir"
@@ -171,13 +225,19 @@ PYTHON
 
     if "$SQLCMD" "${SQLCMD_ARGS[@]}" -d master -i "$step_file" \
          > "$WORK_DIR/step.log" 2>&1; then
-      printf 'PASS\t%s\n' "$current_label" >> "$results_file"
+      printf 'PASS\t%s\t\n' "$current_label" >> "$results_file"
       echo "  PASS  $current_label"
     else
-      printf 'FAIL\t%s\n' "$current_label" >> "$results_file"
+      signature="$(error_signature "$WORK_DIR/step.log")"
+      printf 'FAIL\t%s\t%s\n' "$current_label" "$signature" >> "$results_file"
       echo "  FAIL  $current_label"
-      # Keep the error text; it is what a reviewer needs to see.
-      sed 's/^/        /' "$WORK_DIR/step.log" | tail -25
+      # Surface the diagnostics themselves, not a blind tail: these procs print
+      # result sets, so the error scrolls out of view long before the end.
+      {
+        grep -E -A2 '^(Msg [0-9]+,|Sqlcmd: Error)' "$WORK_DIR/step.log" | head -24 || true
+        echo "--- last lines ---"
+        tail -6 "$WORK_DIR/step.log"
+      } | sed 's/^/        /'
       failures=$((failures + 1))
     fi
   done
@@ -188,7 +248,13 @@ PYTHON
 # ---------------------------------------------------------------------------
 # sp_Blitz findings, captured through the @Output* table path so that code path
 # gets exercised too. Ordered so the two passes are directly comparable.
+#
+# Findings whose text embeds a timestamp or other per-run value are excluded --
+# CheckID 156 puts GETDATE() straight into Finding, so leaving it in would report
+# a removal and an addition on every single run and bury any real change.
 # ---------------------------------------------------------------------------
+VOLATILE_CHECK_IDS="156"
+
 capture_findings() {
   local destination="$1"
 
@@ -213,12 +279,17 @@ SELECT CONVERT(VARCHAR(10), CheckID)
        + '|' + ISNULL(DatabaseName, '(server)')
        + '|' + ISNULL(Finding, '')
 FROM dbo.BlitzFindings
+WHERE CheckID NOT IN ($VOLATILE_CHECK_IDS)
 ORDER BY CheckID, DatabaseName, Finding;
 " | sed '/^$/d;/rows affected/d' | sort -u > "$destination"
 }
 
 # ---------------------------------------------------------------------------
 # Reset mutable state between passes so the two runs see the same server.
+#
+# Anything a matrix step can create has to be listed here, or the head pass
+# skips the create path the base pass already took and the comparison quietly
+# stops testing it.
 # ---------------------------------------------------------------------------
 reset_between_passes() {
   run_query "
@@ -235,10 +306,20 @@ DECLARE @drop NVARCHAR(MAX) = N'';
 SELECT @drop = @drop + N'DROP TABLE FRKSmokeTest.dbo.' + QUOTENAME(name) + N';'
 FROM FRKSmokeTest.sys.tables
 WHERE name IN (N'BlitzOutput', N'BlitzCache', N'BlitzFirst', N'BlitzFirst_FileStats',
-               N'BlitzFirst_PerfmonStats', N'BlitzFirst_WaitStats', N'BlitzWho',
+               N'BlitzFirst_PerfmonStats', N'BlitzFirst_WaitStats',
+               N'BlitzFirst_WaitStats_Categories', N'BlitzWho',
                N'BlitzWho_Results', N'BlitzLock', N'BlitzIndex', N'BlitzFindings');
 
 IF @drop <> N'' EXEC sys.sp_executesql @drop;
+
+/* sp_BlitzLock creates synonyms when logging to a table. */
+DECLARE @dropsyn NVARCHAR(MAX) = N'';
+
+SELECT @dropsyn = @dropsyn + N'DROP SYNONYM ' + QUOTENAME(name) + N';'
+FROM sys.synonyms
+WHERE name IN (N'DeadlockFindings', N'DeadLockTbl');
+
+IF @dropsyn <> N'' EXEC sys.sp_executesql @dropsyn;
 " >/dev/null
 }
 
@@ -246,6 +327,22 @@ IF @drop <> N'' EXEC sys.sp_executesql @drop;
 # Main
 # ---------------------------------------------------------------------------
 wait_for_sql_server
+wait_for_wait_stats
+
+# sp_DatabaseRestore aborts immediately unless Ola Hallengren's CommandExecute
+# exists in the calling database, so its execute path is untestable without it.
+# The workflow downloads and checksums the file; installing it has to wait until
+# the instance is accepting connections, so it happens here.
+if [[ -n "${COMMANDEXECUTE_SQL:-}" ]]; then
+  if [[ -f "$COMMANDEXECUTE_SQL" ]]; then
+    echo
+    echo "=== Installing CommandExecute (sp_DatabaseRestore dependency) ==="
+    run_file "$COMMANDEXECUTE_SQL"
+  else
+    echo "::error::COMMANDEXECUTE_SQL is set to '$COMMANDEXECUTE_SQL' but that file does not exist." >&2
+    exit 1
+  fi
+fi
 
 echo
 echo "=== Seeding test data ==="
@@ -271,6 +368,7 @@ else
   echo "No usable base revision (GITHUB_BASE_SHA/GITHUB_BASE_REF); skipping the"
   echo "comparison pass and checking this branch for errors only."
   : > "$WORK_DIR/base-results.txt"
+  : > "$WORK_DIR/base-findings.txt"
 fi
 
 echo
@@ -316,29 +414,42 @@ fi
 
 # ---------------------------------------------------------------------------
 # Report: errors decide the build
+#
+# A head failure counts as pre-existing only when the same step failed on base
+# with the same diagnostics. A step that fails on base for one reason and on
+# head for another is a new error.
 # ---------------------------------------------------------------------------
 echo
 echo "=== Errors ==="
 
-head_failures="$(awk -F'\t' '$1 == "FAIL" { print $2 }' "$WORK_DIR/head-results.txt" || true)"
-base_failures="$(awk -F'\t' '$1 == "FAIL" { print $2 }' "$WORK_DIR/base-results.txt" || true)"
-
 new_failures=""
-while IFS= read -r failing_step; do
-  [[ -n "$failing_step" ]] || continue
-  if ! grep -Fxq "$failing_step" <<< "$base_failures"; then
-    new_failures+="$failing_step"$'\n'
-  fi
-done <<< "$head_failures"
+pre_existing=""
 
-pre_existing="$(comm -12 <(sort <<< "$head_failures") <(sort <<< "$base_failures") | sed '/^$/d' || true)"
+while IFS=$'\t' read -r status step_label head_signature; do
+  [[ "$status" == "FAIL" ]] || continue
+
+  base_signature="$(awk -F'\t' -v want="$step_label" \
+    '$1 == "FAIL" && $2 == want { print $3; exit }' "$WORK_DIR/base-results.txt")"
+
+  if [[ -n "$base_signature" && "$base_signature" == "$head_signature" ]]; then
+    pre_existing+="$step_label -- $head_signature"$'\n'
+  else
+    if [[ -n "$base_signature" ]]; then
+      new_failures+="$step_label -- error changed: base [$base_signature] head [$head_signature]"$'\n'
+    else
+      new_failures+="$step_label -- $head_signature"$'\n'
+    fi
+  fi
+done < "$WORK_DIR/head-results.txt"
+
+pre_existing="$(sed '/^$/d' <<< "$pre_existing")"
+new_failures="$(sed '/^$/d' <<< "$new_failures")"
 
 if [[ -n "$pre_existing" ]]; then
-  echo "Already failing on base -- not caused by this branch:"
+  echo "Already failing on base with the same error -- not caused by this branch:"
   sed 's/^/  ~ /' <<< "$pre_existing"
 fi
 
-new_failures="$(sed '/^$/d' <<< "$new_failures")"
 if [[ -n "$new_failures" ]]; then
   echo
   echo "::error::This branch introduces SQL errors in $(wc -l <<< "$new_failures" | tr -d ' ') step(s)."

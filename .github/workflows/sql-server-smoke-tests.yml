@@ -67,5 +67,21 @@ jobs:
           sudo env ACCEPT_EULA=Y apt-get install -y mssql-tools18 unixodbc-dev
           echo "/opt/mssql-tools18/bin" >> "$GITHUB_PATH"
 
+      # sp_DatabaseRestore refuses to run without Ola Hallengren's
+      # dbo.CommandExecute, so without this its execute path is never covered.
+      # It is not vendored in this repo, so CI fetches it and verifies the
+      # checksum: if upstream changes, this fails loudly rather than silently
+      # running different code. Update the hash deliberately after reviewing
+      # the upstream diff.
+      - name: Fetch CommandExecute (sp_DatabaseRestore dependency)
+        env:
+          COMMANDEXECUTE_URL: https://raw.githubusercontent.com/olahallengren/sql-server-maintenance-solution/master/CommandExecute.sql
+          COMMANDEXECUTE_SHA256: 80e65a63e0dd81a8073c69b538ba222381354bd3435ba6141e6fb8eb6acbb070
+        run: |
+          curl -sSL --fail "$COMMANDEXECUTE_URL" -o "$RUNNER_TEMP/CommandExecute.sql"
+          echo "$COMMANDEXECUTE_SHA256  $RUNNER_TEMP/CommandExecute.sql" | sha256sum -c -
+
       - name: Run SQL Server smoke tests
+        env:
+          COMMANDEXECUTE_SQL: ${{ runner.temp }}/CommandExecute.sql
         run: bash .github/scripts/run-sql-server-smoke-tests.sh

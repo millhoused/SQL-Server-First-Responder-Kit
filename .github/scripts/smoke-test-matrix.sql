@@ -167,6 +167,10 @@ EXEC dbo.sp_kill @ExecuteKills = 'Y', @AppName = 'NoSuchApp-FRKSmokeTest';
 --#STEP: sp_DatabaseRestore help
 EXEC dbo.sp_DatabaseRestore @Help = 1;
 
+/*
+Requires Ola Hallengren's dbo.CommandExecute, which sp_DatabaseRestore refuses to
+run without. CI installs it into master before this runs; see the workflow.
+*/
 --#STEP: sp_DatabaseRestore restore from seeded backups
 EXEC dbo.sp_DatabaseRestore
      @Database            = 'FRKSmokeTest',
@@ -180,21 +184,34 @@ EXEC dbo.sp_DatabaseRestore
 EXEC dbo.sp_BlitzPlanCompare @Help = 1;
 
 /*
-Picks a plan handle out of the cache the seed step populated. If the cache has
-been swept the step still has to run clean, so the EXEC is guarded rather than
-allowed to fail on a NULL hash.
+Runs a uniquely marked query in FRKSmokeTest's own context, then finds that plan
+by its marker AND by the plan's dbid. The dbid filter matters: this outer batch
+runs in master and its text also contains the marker, so without it the lookup
+can pick up the master-context plan and sp_BlitzPlanCompare's @DatabaseName
+filter then fails to match it.
+
+If the plan cannot be found the step fails loudly rather than skipping quietly --
+a comparison that silently never runs is worse than no step at all.
 */
 --#STEP: sp_BlitzPlanCompare against a cached plan
-DECLARE @QueryHash BINARY(8);
+EXEC FRKSmokeTest.sys.sp_executesql
+     N'SELECT /* FRKPlanCompareMarker */ COUNT_BIG(*) AS MarkedCount
+       FROM dbo.Users AS u
+       JOIN dbo.Posts AS p ON p.OwnerUserId = u.Id
+       WHERE u.Reputation > 10;';
 
-SELECT TOP (1) @QueryHash = qs.query_hash
+DECLARE @QueryPlanHash BINARY(8);
+
+SELECT TOP (1) @QueryPlanHash = qs.query_plan_hash
 FROM sys.dm_exec_query_stats AS qs
 CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) AS st
-WHERE st.text LIKE N'%FRKSmokeTest%'
-   OR st.text LIKE N'%CommentsHeap%'
-ORDER BY qs.last_execution_time DESC;
+CROSS APPLY sys.dm_exec_plan_attributes(qs.plan_handle) AS pa
+WHERE st.text LIKE N'%FRKPlanCompareMarker%'
+  AND pa.attribute = 'dbid'
+  AND CONVERT(INT, pa.value) = DB_ID('FRKSmokeTest')
+ORDER BY qs.creation_time DESC;
 
-IF @QueryHash IS NOT NULL
-    EXEC dbo.sp_BlitzPlanCompare @QueryHash = @QueryHash, @DatabaseName = 'FRKSmokeTest';
-ELSE
-    PRINT 'No cached plan matched; skipping sp_BlitzPlanCompare comparison.';
+IF @QueryPlanHash IS NULL
+    RAISERROR('Seeded marker query was not found in the plan cache; sp_BlitzPlanCompare was not exercised.', 16, 1);
+
+EXEC dbo.sp_BlitzPlanCompare @QueryPlanHash = @QueryPlanHash, @DatabaseName = 'FRKSmokeTest';
