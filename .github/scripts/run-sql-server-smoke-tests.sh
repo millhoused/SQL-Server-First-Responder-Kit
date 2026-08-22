@@ -30,6 +30,18 @@ SEED_SQL="$SCRIPT_DIR/smoke-test-seed.sql"
 MATRIX_SQL="$SCRIPT_DIR/smoke-test-matrix.sql"
 MATRIX_REL_PATH=".github/scripts/smoke-test-matrix.sql"
 
+# Everything that shapes how a step runs. If the PR touches any of it, no
+# failure may be grandfathered: both passes use THIS branch's harness, so a
+# change that breaks it -- dropping -I, say -- breaks unchanged steps against
+# base and head alike and would otherwise be waved through as pre-existing.
+HARNESS_FILES=(
+  ".github/scripts/run-sql-server-smoke-tests.sh"
+  ".github/scripts/smoke-test-seed.sql"
+  ".github/scripts/smoke-test-matrix.sql"
+  ".github/workflows/sql-server-smoke-tests.yml"
+)
+harness_unchanged=0
+
 # Every non-deprecated script in the kit. sp_BlitzUpdate is deliberately absent:
 # it rewrites the procs mid-run, which would invalidate every later step and the
 # base-vs-head comparison (issue #4046, decision 4).
@@ -161,8 +173,50 @@ materialise_kit() {
   done
 }
 
+kit_proc_name() {
+  basename "$1" .sql
+}
+
+# Each pass starts from absent kit objects.
+#
+# Otherwise the previous pass's procedures survive: a script deleted on head is
+# silently skipped by the install loop, and a script reduced to an empty file
+# still makes sqlcmd exit 0. Either way the head matrix would run the stale base
+# procedure and pass without ever touching the head artifact.
+drop_kit_objects() {
+  local script proc statements=""
+
+  for script in "${KIT_SCRIPTS[@]}"; do
+    proc="$(kit_proc_name "$script")"
+    statements+="IF OBJECT_ID('dbo.$proc', 'P') IS NOT NULL DROP PROCEDURE dbo.$proc;"
+  done
+
+  run_query "SET NOCOUNT ON; $statements" >/dev/null
+}
+
+# Installing without error is not proof the procedure exists.
+verify_kit_installed() {
+  local dir="$1" script proc missing=""
+
+  for script in "${KIT_SCRIPTS[@]}"; do
+    [[ -f "$dir/$script" ]] || continue
+    proc="$(kit_proc_name "$script")"
+    if [[ "$(run_scalar "SET NOCOUNT ON;
+SELECT CASE WHEN OBJECT_ID('dbo.$proc', 'P') IS NULL THEN 'MISSING' ELSE 'OK' END;")" != "OK" ]]; then
+      missing+="$proc "
+    fi
+  done
+
+  if [[ -n "$missing" ]]; then
+    echo "::error::Installed without error but these procedures do not exist: $missing"
+    return 1
+  fi
+}
+
 install_kit() {
   local dir="$1" quiet="${2:-}" script
+
+  drop_kit_objects
 
   for script in "${KIT_SCRIPTS[@]}"; do
     [[ -f "$dir/$script" ]] || continue
@@ -173,6 +227,8 @@ install_kit() {
       return 1
     fi
   done
+
+  verify_kit_installed "$dir"
 }
 
 # ---------------------------------------------------------------------------
@@ -189,8 +245,15 @@ install_kit() {
 # unchanged.
 #
 # Stripped, because they move without the error changing: server name (random
-# container hostname), Procedure/Line (shift whenever a PR edits the file above
-# them), and any quoted literal (file paths and object names vary per run).
+# container hostname) and Procedure/Line (shift whenever a PR edits the file
+# above them).
+#
+# Quoted literals are NOT stripped wholesale. A quoted name is often the only
+# thing separating two errors -- Msg 208 for 'OldTable' and for 'NewTable' are
+# different bugs -- so blanking them all would let a real regression inherit a
+# grandfathered signature. Only quoted values containing a path separator are
+# normalised, which covers the volatile ones (rotating trace files, per-run
+# backup paths) and leaves deterministic identifiers intact.
 # ---------------------------------------------------------------------------
 error_signature() {
   awk '
@@ -202,7 +265,7 @@ error_signature() {
     /^Sqlcmd: Error/ { print }
   ' "$1" 2>/dev/null \
     | sed -E "s/, Server [^,]+,/,/; s/, Procedure [^,]+,/,/; s/, Line [0-9]+//" \
-    | sed -E "s/'[^']*'/'X'/g" \
+    | sed -E "s@'[^']*[/\\\\][^']*'@'PATH'@g" \
     | sort -u \
     | tr '\n' ';' \
     || true
@@ -218,6 +281,26 @@ error_signature() {
 # the same body, may be grandfathered; anything new or edited has to pass on its
 # own merits.
 # ---------------------------------------------------------------------------
+# Sets harness_unchanged. Any difference, or any file absent from base, means no.
+check_harness_unchanged() {
+  local revision="$1" file
+
+  for file in "${HARNESS_FILES[@]}"; do
+    if ! git -C "$REPO_ROOT" cat-file -e "$revision:$file" 2>/dev/null; then
+      echo "  harness file is new on this branch: $file"
+      harness_unchanged=0
+      return
+    fi
+    if ! git -C "$REPO_ROOT" show "$revision:$file" | cmp -s - "$REPO_ROOT/$file"; then
+      echo "  harness file changed on this branch: $file"
+      harness_unchanged=0
+      return
+    fi
+  done
+
+  harness_unchanged=1
+}
+
 step_unchanged_from_base() {
   local label="$1" head_file="$2" base_label_file
 
@@ -440,22 +523,12 @@ IF @dropsyn <> N'' EXEC sys.sp_executesql @dropsyn;
 wait_for_sql_server
 wait_for_wait_stats
 
-# sp_DatabaseRestore aborts unless Ola Hallengren's CommandExecute exists in the
-# calling database, and CommandExecute in turn refuses @LogToTable = 'Y' unless
-# dbo.CommandLog exists -- sp_DatabaseRestore always passes 'Y'. Both are needed
-# or the restore path is untestable. The workflow downloads and checksums them;
-# installing has to wait until the instance is up, so it happens here. CommandLog
-# first: CommandExecute checks for it at runtime.
-for dependency in "${COMMANDLOG_SQL:-}" "${COMMANDEXECUTE_SQL:-}"; do
-  [[ -n "$dependency" ]] || continue
-  if [[ ! -f "$dependency" ]]; then
-    echo "::error::Expected dependency '$dependency' does not exist." >&2
-    exit 1
-  fi
-  echo
-  echo "=== Installing $(basename "$dependency") (sp_DatabaseRestore dependency) ==="
-  run_file "$dependency"
-done
+# sp_DatabaseRestore's dependencies (Ola Hallengren's CommandLog and
+# CommandExecute) are deliberately NOT installed: the only invocation left is
+# @Help = 1, which returns at sp_DatabaseRestore.sql:71, long before the
+# CommandExecute check at :255. Fetching them would add two network downloads
+# and two checksums that can redden every PR while exercising nothing. Restore
+# them alongside the execute-path step when #4049 lands.
 
 echo
 echo "=== Seeding test data ==="
@@ -474,6 +547,13 @@ head_findings_ok=0
 if [[ -n "$BASE_REVISION" ]] && git -C "$REPO_ROOT" rev-parse --verify --quiet "$BASE_REVISION" >/dev/null; then
   echo
   echo "=== Pass 1: base ($BASE_REVISION) ==="
+
+  check_harness_unchanged "$BASE_REVISION"
+  if [[ "$harness_unchanged" -eq 1 ]]; then
+    echo "  harness unchanged from base; unchanged steps may be grandfathered"
+  else
+    echo "  harness differs from base; every step must pass on its own merits"
+  fi
 
   # Base's own copy of the matrix, so we can tell which steps this PR added or
   # edited. Those must pass on their own merits -- see step_unchanged_from_base.
@@ -578,6 +658,7 @@ while IFS=$'\t' read -r status step_label head_signature step_file; do
     '$1 == "FAIL" && $2 == want { print $3; exit }' "$WORK_DIR/base-results.txt")"
 
   if [[ -n "$base_signature" && "$base_signature" == "$head_signature" ]] \
+     && [[ "$harness_unchanged" -eq 1 ]] \
      && step_unchanged_from_base "$step_label" "$step_file"; then
     pre_existing+="$step_label -- $head_signature"$'\n'
   else
@@ -614,6 +695,7 @@ if [[ -n "$mismatches" ]]; then
       if run_one_step "$step_file" "$WORK_DIR/recheck-base.log"; then
         new_failures+="$step_label -- $head_signature"$'\n'
       elif [[ "$STEP_SIGNATURE" == "$head_signature" ]] \
+           && [[ "$harness_unchanged" -eq 1 ]] \
            && step_unchanged_from_base "$step_label" "$step_file"; then
         echo "  environmental: '$step_label' fails the same way on base when re-run -- not a regression"
         pre_existing+="$step_label -- $head_signature (confirmed on re-run)"$'\n'
