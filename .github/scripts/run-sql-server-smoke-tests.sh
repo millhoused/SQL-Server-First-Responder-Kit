@@ -72,6 +72,15 @@ run_file() {
   "$SQLCMD" "${SQLCMD_ARGS[@]}" -d master -i "$1"
 }
 
+# Single bare value, no headers or row counts. run_query cannot do this: it only
+# forwards "$1", so any extra sqlcmd flags handed to it are silently dropped.
+run_scalar() {
+  "$SQLCMD" "${SQLCMD_ARGS[@]}" -d master -h -1 -W -Q "$1" 2>/dev/null \
+    | sed '/^$/d;/rows affected/d' \
+    | head -1 \
+    | tr -d '[:space:]'
+}
+
 # ---------------------------------------------------------------------------
 # Wait for the container
 # ---------------------------------------------------------------------------
@@ -106,18 +115,28 @@ wait_for_sql_server() {
 # on how long the container took to start, so it fires on whichever pass happens
 # to run first and shows up as a spurious base-vs-head difference. Waiting the
 # window out keeps the two passes comparable. Remove this once #4048 is fixed.
+#
+# The value must parse as a number greater than zero. Anything else -- an empty
+# result, a header line, an error -- means we have not confirmed the window has
+# passed, so keep waiting rather than assuming the best.
 # ---------------------------------------------------------------------------
 wait_for_wait_stats() {
+  local uptime_minutes
+
   echo "Waiting for the instance to pass one minute of uptime (issue #4048)..."
   for attempt in {1..40}; do
-    if [[ "$(run_query "SET NOCOUNT ON;
+    uptime_minutes="$(run_scalar "SET NOCOUNT ON;
 SELECT DATEDIFF(MINUTE, create_date, CURRENT_TIMESTAMP)
-FROM sys.databases WHERE name = 'tempdb';" -h -1 -W 2>/dev/null | head -1 | tr -d '[:space:]')" != "0" ]]; then
-      echo "Uptime window cleared."
+FROM sys.databases WHERE name = 'tempdb';")"
+
+    if [[ "$uptime_minutes" =~ ^[0-9]+$ ]] && (( uptime_minutes > 0 )); then
+      echo "Uptime window cleared after ${attempt} check(s) (${uptime_minutes} minute(s) up)."
       return 0
     fi
+
     sleep 5
   done
+
   echo "::warning::Instance still reports under a minute of uptime; continuing anyway."
 }
 
@@ -142,11 +161,11 @@ materialise_kit() {
 }
 
 install_kit() {
-  local dir="$1" script
+  local dir="$1" quiet="${2:-}" script
 
   for script in "${KIT_SCRIPTS[@]}"; do
     [[ -f "$dir/$script" ]] || continue
-    echo "  installing $script"
+    [[ -n "$quiet" ]] || echo "  installing $script"
     if ! run_file "$dir/$script" > "$WORK_DIR/install.log" 2>&1; then
       echo "::error::Failed to install $script"
       cat "$WORK_DIR/install.log"
@@ -160,34 +179,50 @@ install_kit() {
 #
 # Comparing failure *labels* alone would turn every step that fails on base into
 # a permanent allowlist entry: a PR could introduce a completely different error
-# inside that step and stay green. Comparing the diagnostics instead means only
-# the identical error is treated as pre-existing.
+# inside that step and stay green.
 #
-# Server name and line numbers are stripped -- the container's hostname is random
-# per run, and a line number shifting is exactly the kind of change a PR makes
-# without changing the error itself.
+# The message text has to be part of the signature, not just the number. Msg
+# 50000 is whatever RAISERROR was handed, and CommandExecute alone raises it for
+# many unrelated validation failures -- keyed on the number only, a step could
+# change from one Msg 50000 to a completely different one and still look
+# unchanged.
+#
+# Stripped, because they move without the error changing: server name (random
+# container hostname), Procedure/Line (shift whenever a PR edits the file above
+# them), and any quoted literal (file paths and object names vary per run).
 # ---------------------------------------------------------------------------
 error_signature() {
-  grep -oE '^(Msg [0-9]+, Level [0-9]+, State [0-9]+|Sqlcmd: Error)[^,]*' "$1" 2>/dev/null \
-    | sed -E 's/, Server [^,]+//; s/, (Procedure|Line) [^,]*//g' \
+  awk '
+    /^Msg [0-9]+, Level [0-9]+, State [0-9]+/ {
+      header = $0
+      if ((getline detail) > 0) { print header " :: " detail } else { print header }
+      next
+    }
+    /^Sqlcmd: Error/ { print }
+  ' "$1" 2>/dev/null \
+    | sed -E "s/, Server [^,]+,/,/; s/, Procedure [^,]+,/,/; s/, Line [0-9]+//" \
+    | sed -E "s/'[^']*'/'X'/g" \
     | sort -u \
     | tr '\n' ';' \
     || true
 }
 
-# ---------------------------------------------------------------------------
-# Split the matrix on --#STEP: markers and run each step on its own.
-#
-# Each step runs separately so one failure is attributed to one labelled step
-# and the rest of the matrix still runs -- we want every problem in a single CI
-# round, not just the first.
-#
-# Writes "<status><TAB><label><TAB><error signature>" per step.
-# ---------------------------------------------------------------------------
-run_matrix() {
-  local label="$1" results_file="$2"
-  local steps_dir="$WORK_DIR/steps-$label"
-  local step_file current_label failures=0 signature
+# Run one step file. Sets STEP_SIGNATURE; returns non-zero if the step failed.
+STEP_SIGNATURE=""
+run_one_step() {
+  local step_file="$1" log_file="$2"
+
+  if "$SQLCMD" "${SQLCMD_ARGS[@]}" -d master -i "$step_file" > "$log_file" 2>&1; then
+    STEP_SIGNATURE=""
+    return 0
+  fi
+
+  STEP_SIGNATURE="$(error_signature "$log_file")"
+  return 1
+}
+
+split_matrix() {
+  local steps_dir="$1"
 
   rm -rf "$steps_dir"
   mkdir -p "$steps_dir"
@@ -217,19 +252,30 @@ for index, (step_label, body) in enumerate(steps):
     with open(os.path.join(steps_dir, f"{index:03d}.label"), "w", encoding="utf-8") as handle:
         handle.write(step_label)
 PYTHON
+}
+
+# ---------------------------------------------------------------------------
+# Run every step on its own, so one failure is attributed to one labelled step
+# and the rest of the matrix still runs. One CI round should surface every
+# problem, not just the first.
+#
+# Writes "<status><TAB><label><TAB><signature><TAB><step file>" per step.
+# ---------------------------------------------------------------------------
+run_matrix() {
+  local pass_name="$1" results_file="$2"
+  local steps_dir="$WORK_DIR/steps"
+  local step_file current_label failures=0
 
   : > "$results_file"
 
   for step_file in "$steps_dir"/*.sql; do
     current_label="$(cat "${step_file%.sql}.label")"
 
-    if "$SQLCMD" "${SQLCMD_ARGS[@]}" -d master -i "$step_file" \
-         > "$WORK_DIR/step.log" 2>&1; then
-      printf 'PASS\t%s\t\n' "$current_label" >> "$results_file"
+    if run_one_step "$step_file" "$WORK_DIR/step.log"; then
+      printf 'PASS\t%s\t\t%s\n' "$current_label" "$step_file" >> "$results_file"
       echo "  PASS  $current_label"
     else
-      signature="$(error_signature "$WORK_DIR/step.log")"
-      printf 'FAIL\t%s\t%s\n' "$current_label" "$signature" >> "$results_file"
+      printf 'FAIL\t%s\t%s\t%s\n' "$current_label" "$STEP_SIGNATURE" "$step_file" >> "$results_file"
       echo "  FAIL  $current_label"
       # Surface the diagnostics themselves, not a blind tail: these procs print
       # result sets, so the error scrolls out of view long before the end.
@@ -242,7 +288,7 @@ PYTHON
     fi
   done
 
-  echo "  $label: $failures failing step(s)"
+  echo "  $pass_name: $failures failing step(s)"
 }
 
 # ---------------------------------------------------------------------------
@@ -295,7 +341,8 @@ ORDER BY CheckID, DatabaseName, Finding;
 #
 # Anything a matrix step can create has to be listed here, or the head pass
 # skips the create path the base pass already took and the comparison quietly
-# stops testing it.
+# stops testing it. BlitzChecksToSkip is deliberately NOT dropped -- the seed
+# creates it once and both passes need it.
 # ---------------------------------------------------------------------------
 reset_between_passes() {
   run_query "
@@ -335,24 +382,28 @@ IF @dropsyn <> N'' EXEC sys.sp_executesql @dropsyn;
 wait_for_sql_server
 wait_for_wait_stats
 
-# sp_DatabaseRestore aborts immediately unless Ola Hallengren's CommandExecute
-# exists in the calling database, so its execute path is untestable without it.
-# The workflow downloads and checksums the file; installing it has to wait until
-# the instance is accepting connections, so it happens here.
-if [[ -n "${COMMANDEXECUTE_SQL:-}" ]]; then
-  if [[ -f "$COMMANDEXECUTE_SQL" ]]; then
-    echo
-    echo "=== Installing CommandExecute (sp_DatabaseRestore dependency) ==="
-    run_file "$COMMANDEXECUTE_SQL"
-  else
-    echo "::error::COMMANDEXECUTE_SQL is set to '$COMMANDEXECUTE_SQL' but that file does not exist." >&2
+# sp_DatabaseRestore aborts unless Ola Hallengren's CommandExecute exists in the
+# calling database, and CommandExecute in turn refuses @LogToTable = 'Y' unless
+# dbo.CommandLog exists -- sp_DatabaseRestore always passes 'Y'. Both are needed
+# or the restore path is untestable. The workflow downloads and checksums them;
+# installing has to wait until the instance is up, so it happens here. CommandLog
+# first: CommandExecute checks for it at runtime.
+for dependency in "${COMMANDLOG_SQL:-}" "${COMMANDEXECUTE_SQL:-}"; do
+  [[ -n "$dependency" ]] || continue
+  if [[ ! -f "$dependency" ]]; then
+    echo "::error::Expected dependency '$dependency' does not exist." >&2
     exit 1
   fi
-fi
+  echo
+  echo "=== Installing $(basename "$dependency") (sp_DatabaseRestore dependency) ==="
+  run_file "$dependency"
+done
 
 echo
 echo "=== Seeding test data ==="
 run_file "$SEED_SQL"
+
+split_matrix "$WORK_DIR/steps"
 
 BASE_REVISION="${GITHUB_BASE_SHA:-}"
 if [[ -z "$BASE_REVISION" && -n "${GITHUB_BASE_REF:-}" ]]; then
@@ -422,16 +473,23 @@ fi
 # Report: errors decide the build
 #
 # A head failure counts as pre-existing only when the same step failed on base
-# with the same diagnostics. A step that fails on base for one reason and on
-# head for another is a new error.
+# with the same diagnostics.
+#
+# A first-attempt mismatch is not enough to blame the PR. The two passes run
+# minutes apart against one server whose state keeps moving, and transient
+# errors -- a torn default-trace read, a plan aged out mid-step -- land on
+# whichever pass is unlucky. That produced a red build on a PR that changed no
+# stored procedure at all. So every mismatch is re-confirmed before it counts:
+# retry on head, and if it still fails, put base's copies back and run it there
+# too. Only a failure that survives both is attributed to this branch.
 # ---------------------------------------------------------------------------
 echo
 echo "=== Errors ==="
 
-new_failures=""
+mismatches=""
 pre_existing=""
 
-while IFS=$'\t' read -r status step_label head_signature; do
+while IFS=$'\t' read -r status step_label head_signature step_file; do
   [[ "$status" == "FAIL" ]] || continue
 
   base_signature="$(awk -F'\t' -v want="$step_label" \
@@ -440,18 +498,60 @@ while IFS=$'\t' read -r status step_label head_signature; do
   if [[ -n "$base_signature" && "$base_signature" == "$head_signature" ]]; then
     pre_existing+="$step_label -- $head_signature"$'\n'
   else
-    if [[ -n "$base_signature" ]]; then
-      new_failures+="$step_label -- error changed: base [$base_signature] head [$head_signature]"$'\n'
-    else
-      new_failures+="$step_label -- $head_signature"$'\n'
-    fi
+    mismatches+="$step_label"$'\t'"$head_signature"$'\t'"$step_file"$'\t'"$base_signature"$'\n'
   fi
 done < "$WORK_DIR/head-results.txt"
+
+mismatches="$(sed '/^$/d' <<< "$mismatches")"
+new_failures=""
+
+if [[ -n "$mismatches" ]]; then
+  echo "Re-confirming $(wc -l <<< "$mismatches" | tr -d ' ') mismatch(es) before attributing them to this branch..."
+
+  # Round 1: does it still fail on head?
+  still_failing=""
+  while IFS=$'\t' read -r step_label head_signature step_file base_signature; do
+    [[ -n "$step_label" ]] || continue
+    if run_one_step "$step_file" "$WORK_DIR/recheck.log"; then
+      echo "  transient: '$step_label' passed on retry against this branch -- not a regression"
+    else
+      still_failing+="$step_label"$'\t'"$STEP_SIGNATURE"$'\t'"$step_file"$'\t'"$base_signature"$'\n'
+    fi
+  done <<< "$mismatches"
+
+  still_failing="$(sed '/^$/d' <<< "$still_failing")"
+
+  # Round 2: reinstall base and see whether it fails there too, now.
+  if [[ -n "$still_failing" && "$base_ran" -eq 1 ]]; then
+    echo "  reinstalling base to re-test $(wc -l <<< "$still_failing" | tr -d ' ') step(s) against it..."
+    install_kit "$WORK_DIR/base" quiet
+
+    while IFS=$'\t' read -r step_label head_signature step_file base_signature; do
+      [[ -n "$step_label" ]] || continue
+      if run_one_step "$step_file" "$WORK_DIR/recheck-base.log"; then
+        new_failures+="$step_label -- $head_signature"$'\n'
+      elif [[ "$STEP_SIGNATURE" == "$head_signature" ]]; then
+        echo "  environmental: '$step_label' fails the same way on base when re-run -- not a regression"
+        pre_existing+="$step_label -- $head_signature (confirmed on re-run)"$'\n'
+      else
+        new_failures+="$step_label -- error changed: base [$STEP_SIGNATURE] head [$head_signature]"$'\n'
+      fi
+    done <<< "$still_failing"
+
+    install_kit "$REPO_ROOT" quiet
+  elif [[ -n "$still_failing" ]]; then
+    while IFS=$'\t' read -r step_label head_signature _ _; do
+      [[ -n "$step_label" ]] || continue
+      new_failures+="$step_label -- $head_signature"$'\n'
+    done <<< "$still_failing"
+  fi
+fi
 
 pre_existing="$(sed '/^$/d' <<< "$pre_existing")"
 new_failures="$(sed '/^$/d' <<< "$new_failures")"
 
 if [[ -n "$pre_existing" ]]; then
+  echo
   echo "Already failing on base with the same error -- not caused by this branch:"
   sed 's/^/  ~ /' <<< "$pre_existing"
 fi
@@ -463,6 +563,7 @@ if [[ -n "$new_failures" ]]; then
   {
     echo "### New SQL errors on \`${MSSQL_IMAGE:-this image}\`"
     echo
+    echo "Each was re-run against this branch and against base before being reported."
     echo '```'
     echo "$new_failures"
     echo '```'

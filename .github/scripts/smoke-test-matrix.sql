@@ -187,24 +187,28 @@ EXEC dbo.sp_kill @ExecuteKills = 'Y', @AppName = 'NoSuchApp-FRKSmokeTest';
 EXEC dbo.sp_DatabaseRestore @Help = 1;
 
 /*
-Requires Ola Hallengren's dbo.CommandExecute, which sp_DatabaseRestore refuses to
-run without. CI installs it into master before this runs; see the workflow.
+sp_DatabaseRestore's execute path is NOT covered here, and deliberately so.
 
-KNOWN FAILING on Linux: @MoveFiles defaults to 1, and that path splits the
-filename off PhysicalName with a hardcoded backslash, so on a forward-slash path
-CHARINDEX returns 0 and LEFT(..., -1) raises Msg 537. Tracked in issue #4049.
-Left in deliberately: it fails identically on base and head, so the comparison
-classifies it as pre-existing and it does not fail the build. It turns green on
-its own once #4049 is fixed.
+Its dependencies are installed (CommandLog + CommandExecute, fetched by the
+workflow), so the procedure runs -- but it cannot complete against a Linux
+fixture. @MoveFiles defaults to 1, and that path handles paths with a hardcoded
+backslash in two places: it splits the filename off PhysicalName with
+CHARINDEX('\\', ...), which returns 0 on a forward-slash path and makes
+LEFT(..., -1) raise Msg 537; and it joins the backup directory to the file name
+with a backslash, producing '/var/opt/mssql/data/\\FRKSmokeTest_Full2.bak'.
+
+Tracked in issue #4049. A permanently-failing step is worse than an absent one:
+it trains everyone to expect red and it advertises coverage that does not exist.
+So this stays at @Help until #4049 lands, at which point the invocation below
+should be uncommented.
+
+    EXEC dbo.sp_DatabaseRestore
+         @Database            = 'FRKSmokeTest',
+         @RestoreDatabaseName = 'FRKSmokeTestRestored',
+         @BackupPathFull      = '/var/opt/mssql/data/',
+         @RunRecovery         = 1,
+         @ExistingDBAction    = 3;
 */
---#STEP: sp_DatabaseRestore restore from seeded backups
-EXEC dbo.sp_DatabaseRestore
-     @Database            = 'FRKSmokeTest',
-     @RestoreDatabaseName = 'FRKSmokeTestRestored',
-     @BackupPathFull      = '/var/opt/mssql/data/',
-     @RunRecovery         = 1,
-     @ExistingDBAction    = 3,
-     @Debug               = 1;
 
 --#STEP: sp_BlitzPlanCompare help
 EXEC dbo.sp_BlitzPlanCompare @Help = 1;

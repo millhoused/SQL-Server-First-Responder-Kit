@@ -68,20 +68,27 @@ jobs:
           echo "/opt/mssql-tools18/bin" >> "$GITHUB_PATH"
 
       # sp_DatabaseRestore refuses to run without Ola Hallengren's
-      # dbo.CommandExecute, so without this its execute path is never covered.
-      # It is not vendored in this repo, so CI fetches it and verifies the
-      # checksum: if upstream changes, this fails loudly rather than silently
-      # running different code. Update the hash deliberately after reviewing
+      # dbo.CommandExecute, and CommandExecute in turn refuses @LogToTable = 'Y'
+      # -- which sp_DatabaseRestore always passes -- unless dbo.CommandLog
+      # exists. Both are required or the restore path stays uncovered.
+      #
+      # Neither is vendored in this repo, so CI fetches them and verifies their
+      # checksums: if upstream changes, this fails loudly rather than silently
+      # running different code. Update the hashes deliberately after reviewing
       # the upstream diff.
-      - name: Fetch CommandExecute (sp_DatabaseRestore dependency)
+      - name: Fetch sp_DatabaseRestore dependencies
         env:
-          COMMANDEXECUTE_URL: https://raw.githubusercontent.com/olahallengren/sql-server-maintenance-solution/master/CommandExecute.sql
+          OLA_BASE_URL: https://raw.githubusercontent.com/olahallengren/sql-server-maintenance-solution/master
           COMMANDEXECUTE_SHA256: 80e65a63e0dd81a8073c69b538ba222381354bd3435ba6141e6fb8eb6acbb070
+          COMMANDLOG_SHA256: 7a508fa7ed562ec5ee09d4f587f7f2a87f7a4eb3c57450602ee99cdeb4e18b31
         run: |
-          curl -sSL --fail "$COMMANDEXECUTE_URL" -o "$RUNNER_TEMP/CommandExecute.sql"
+          curl -sSL --fail "$OLA_BASE_URL/CommandExecute.sql" -o "$RUNNER_TEMP/CommandExecute.sql"
+          curl -sSL --fail "$OLA_BASE_URL/CommandLog.sql"     -o "$RUNNER_TEMP/CommandLog.sql"
           echo "$COMMANDEXECUTE_SHA256  $RUNNER_TEMP/CommandExecute.sql" | sha256sum -c -
+          echo "$COMMANDLOG_SHA256  $RUNNER_TEMP/CommandLog.sql" | sha256sum -c -
 
       - name: Run SQL Server smoke tests
         env:
           COMMANDEXECUTE_SQL: ${{ runner.temp }}/CommandExecute.sql
+          COMMANDLOG_SQL: ${{ runner.temp }}/CommandLog.sql
         run: bash .github/scripts/run-sql-server-smoke-tests.sh
