@@ -500,39 +500,43 @@ BEGIN
     DROP DATABASE FRKSmokeTestRestored;
 END;
 
+/* Enumerated by naming convention rather than a hand-maintained list.
+
+   That list was wrong four times over: sp_BlitzLock's synonyms, sp_BlitzFirst's
+   four views, sp_BlitzWho's two, and sp_BlitzLock's BlitzLockFindings. Any proc
+   taking @OutputTableName can create objects derived from it, so naming them one
+   at a time is structurally the losing approach -- every new output path is a
+   silent gap until someone notices the head pass skipped its create branch.
+
+   Everything the kit writes into this database is Blitz-prefixed. The seed's own
+   tables (Users, Posts, CommentsHeap) are not, so they survive; BlitzChecksToSkip
+   is the one Blitz-prefixed object to keep, since the seed creates it once and
+   both passes need it.
+
+   Views before tables: dropping a table first would leave its view orphaned.
+   Both go through the target database's own sp_executesql because DROP VIEW
+   rejects a three-part name (Msg 166), unlike DROP TABLE. */
 DECLARE @drop NVARCHAR(MAX) = N'';
 
-SELECT @drop = @drop + N'DROP TABLE FRKSmokeTest.dbo.' + QUOTENAME(name) + N';'
-FROM FRKSmokeTest.sys.tables
-WHERE name IN (N'BlitzOutput', N'BlitzCache', N'BlitzFirst', N'BlitzFirst_FileStats',
-               N'BlitzFirst_PerfmonStats', N'BlitzFirst_WaitStats',
-               N'BlitzFirst_WaitStats_Categories', N'BlitzWho',
-               N'BlitzWho_Results', N'BlitzLock', N'BlitzIndex', N'BlitzFindings');
-
-/* sp_BlitzFirst's logging path also creates views alongside each table:
-   <FileStats>_Deltas, <PerfmonStats>_Deltas, <PerfmonStats>_Actuals and
-   <WaitStats>_Deltas. Dropping only the tables would leave the base pass's
-   views in place, so the head pass would skip all four view-creation paths. */
-DECLARE @dropview NVARCHAR(MAX) = N'';
-
-/* DROP VIEW rejects a three-part name -- 'DROP VIEW' does not allow specifying
-   the database name as a prefix (Msg 166), unlike DROP TABLE, which accepts one.
-   So the statement is built with two-part names and executed inside the target
-   database via its own sp_executesql. */
-SELECT @dropview = @dropview + N'DROP VIEW dbo.' + QUOTENAME(name) + N';'
+SELECT @drop = @drop + N'DROP VIEW dbo.' + QUOTENAME(name) + N';'
 FROM FRKSmokeTest.sys.views
-WHERE name IN (N'BlitzFirst_FileStats_Deltas', N'BlitzFirst_PerfmonStats_Deltas',
-               N'BlitzFirst_PerfmonStats_Actuals', N'BlitzFirst_WaitStats_Deltas',
-               /* sp_BlitzWho makes <table>_Deltas for whatever table it logs to,
-                  once via sp_BlitzFirst's @OutputTableNameBlitzWho and once from
-                  the direct sp_BlitzWho step. */
-               N'BlitzWho_Deltas', N'BlitzWho_Results_Deltas')
+WHERE name LIKE N'Blitz%'
+  AND name <> N'BlitzChecksToSkip'
   AND SCHEMA_NAME(schema_id) = N'dbo';
 
-IF @dropview <> N'' EXEC FRKSmokeTest.sys.sp_executesql @dropview;
-IF @drop <> N'' EXEC sys.sp_executesql @drop;
+IF @drop <> N'' EXEC FRKSmokeTest.sys.sp_executesql @drop;
 
-/* sp_BlitzLock creates synonyms when logging to a table. */
+SET @drop = N'';
+
+SELECT @drop = @drop + N'DROP TABLE dbo.' + QUOTENAME(name) + N';'
+FROM FRKSmokeTest.sys.tables
+WHERE name LIKE N'Blitz%'
+  AND name <> N'BlitzChecksToSkip'
+  AND SCHEMA_NAME(schema_id) = N'dbo';
+
+IF @drop <> N'' EXEC FRKSmokeTest.sys.sp_executesql @drop;
+
+/* sp_BlitzLock's synonyms, which are not Blitz-prefixed. */
 DECLARE @dropsyn NVARCHAR(MAX) = N'';
 
 SELECT @dropsyn = @dropsyn + N'DROP SYNONYM ' + QUOTENAME(name) + N';'
@@ -738,7 +742,8 @@ if [[ -n "$mismatches" ]]; then
 
       if [[ "$rebase_status" == "PASS" ]]; then
         new_failures+="$step_label -- $head_signature"$'\n'
-      elif [[ "$rebase_signature" == "$head_signature" ]] \
+      elif [[ -n "$rebase_signature" ]] \
+           && [[ "$rebase_signature" == "$head_signature" ]] \
            && [[ "$harness_unchanged" -eq 1 ]] \
            && step_unchanged_from_base "$step_label" "$step_file"; then
         echo "  environmental: '$step_label' fails the same way on base when replayed -- not a regression"
