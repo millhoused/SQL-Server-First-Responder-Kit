@@ -16,8 +16,9 @@ and the remaining steps still run. That means each step must stand alone --
 variables do not carry across steps.
 
 Deliberately excluded:
-  * sp_BlitzUpdate -- it overwrites the procs mid-run, which would invalidate
-    every step after it and the base-vs-head comparison (issue #4046, decision 4).
+  * sp_BlitzUpdate -- it replaces the kit's procedures mid-run, so every step
+    after it would be exercising whatever it just downloaded rather than the
+    code under test (issue #4046, decision 4).
 */
 
 --#STEP: sp_Blitz default
@@ -60,8 +61,6 @@ EXEC dbo.sp_Blitz
 /*
 Both @Check* flags together with table output and a skip list -- a combination
 none of the other steps covers, and the one most likely to be run in anger.
-The trailing SELECT exercises the columns anything reading those results depends
-on, so a rename of CheckID, DatabaseName or Finding fails here.
 */
 --#STEP: sp_Blitz full check to table with skip list
 EXEC dbo.sp_Blitz
@@ -74,11 +73,10 @@ EXEC dbo.sp_Blitz
      @SkipChecksSchema         = 'dbo',
      @SkipChecksTable          = 'BlitzChecksToSkip';
 
-/* The readback the comparison performs, so that renaming or removing CheckID,
-   DatabaseName or Finding fails this classified step instead of silently
-   downgrading the findings diff to "Skipped". The volatile-CheckID filter the
-   runner applies is deliberately not reproduced here -- this exists to prove the
-   columns the readback depends on, not to duplicate the filter. */
+/* Reads the rows back out, so that renaming or dropping CheckID, DatabaseName
+   or Finding fails this step. Those columns are what anything consuming a
+   persisted sp_Blitz result set depends on, and writing the table proves only
+   that it was created, not that it is still shaped the way callers expect. */
 SELECT CONVERT(VARCHAR(10), CheckID)
        + '|' + ISNULL(DatabaseName, '(server)')
        + '|' + ISNULL(Finding, '')

@@ -7,8 +7,8 @@ no index usage, so most checks bind against empty tables and report nothing.
 That still catches runtime errors, but it does not exercise much. This builds
 the smallest state that makes the scripts do real work.
 
-Runs once per CI job, before either pass. Nothing in here should depend on the
-version of the kit being tested.
+Runs once per CI job, before the kit is installed. Nothing in here should depend
+on the version of the kit being tested.
 */
 SET NOCOUNT ON;
 GO
