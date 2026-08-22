@@ -204,6 +204,10 @@ with open(matrix_path, encoding="utf-8") as handle:
 if label is not None:
     steps.append((label, "".join(buf)))
 
+duplicates = {label for label, _ in steps if [l for l, _ in steps].count(label) > 1}
+if duplicates:
+    sys.exit("Duplicate --#STEP: labels in the matrix: " + ", ".join(sorted(duplicates)))
+
 for index, (step_label, body) in enumerate(steps):
     with open(os.path.join(steps_dir, f"{index:03d}.sql"), "w", encoding="utf-8") as handle:
         handle.write(body)
