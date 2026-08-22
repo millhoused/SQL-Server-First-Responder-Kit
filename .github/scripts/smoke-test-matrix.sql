@@ -58,13 +58,12 @@ EXEC dbo.sp_Blitz
      @SkipChecksTable    = 'BlitzChecksToSkip';
 
 /*
-The exact configuration run-sql-server-smoke-tests.sh uses to capture findings
-for the base-vs-head comparison. That capture is guarded so a failure degrades
-the informational diff instead of killing the run -- which means an error unique
-to this combination would only ever be a warning. Running it here too puts it
-through the error classifier, where a new failure fails the build.
+Both @Check* flags together with table output and a skip list -- a combination
+none of the other steps covers, and the one most likely to be run in anger.
+The trailing SELECT exercises the columns anything reading those results depends
+on, so a rename of CheckID, DatabaseName or Finding fails here.
 */
---#STEP: sp_Blitz findings-capture configuration
+--#STEP: sp_Blitz full check to table with skip list
 EXEC dbo.sp_Blitz
      @CheckUserDatabaseObjects = 1,
      @CheckServerInfo          = 1,
