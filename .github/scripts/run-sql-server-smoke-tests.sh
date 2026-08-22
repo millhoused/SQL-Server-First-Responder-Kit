@@ -138,9 +138,12 @@ wait_for_wait_stats() {
 
   echo "Waiting for the instance to pass one minute of uptime (issue #4048)..."
   for attempt in {1..40}; do
+    # `|| true` matters: under set -e a failed command substitution aborts the
+    # script, which would contradict the contract above that an error means
+    # "not yet confirmed, keep waiting".
     uptime_minutes="$(run_scalar "SET NOCOUNT ON;
 SELECT DATEDIFF(MINUTE, create_date, CURRENT_TIMESTAMP)
-FROM sys.databases WHERE name = 'tempdb';")"
+FROM sys.databases WHERE name = 'tempdb';" || true)"
 
     if [[ "$uptime_minutes" =~ ^[0-9]+$ ]] && (( uptime_minutes > 0 )); then
       echo "Uptime window cleared after ${attempt} check(s) (${uptime_minutes} minute(s) up)."
@@ -202,7 +205,7 @@ verify_kit_installed() {
     [[ -f "$dir/$script" ]] || continue
     proc="$(kit_proc_name "$script")"
     if [[ "$(run_scalar "SET NOCOUNT ON;
-SELECT CASE WHEN OBJECT_ID('dbo.$proc', 'P') IS NULL THEN 'MISSING' ELSE 'OK' END;")" != "OK" ]]; then
+SELECT CASE WHEN OBJECT_ID('dbo.$proc', 'P') IS NULL THEN 'MISSING' ELSE 'OK' END;" || true)" != "OK" ]]; then
       missing+="$proc "
     fi
   done
@@ -500,7 +503,11 @@ DECLARE @dropview NVARCHAR(MAX) = N'';
 SELECT @dropview = @dropview + N'DROP VIEW dbo.' + QUOTENAME(name) + N';'
 FROM FRKSmokeTest.sys.views
 WHERE name IN (N'BlitzFirst_FileStats_Deltas', N'BlitzFirst_PerfmonStats_Deltas',
-               N'BlitzFirst_PerfmonStats_Actuals', N'BlitzFirst_WaitStats_Deltas')
+               N'BlitzFirst_PerfmonStats_Actuals', N'BlitzFirst_WaitStats_Deltas',
+               /* sp_BlitzWho makes <table>_Deltas for whatever table it logs to,
+                  once via sp_BlitzFirst's @OutputTableNameBlitzWho and once from
+                  the direct sp_BlitzWho step. */
+               N'BlitzWho_Deltas', N'BlitzWho_Results_Deltas')
   AND SCHEMA_NAME(schema_id) = N'dbo';
 
 IF @dropview <> N'' EXEC FRKSmokeTest.sys.sp_executesql @dropview;
@@ -651,6 +658,11 @@ echo "=== Errors ==="
 mismatches=""
 pre_existing=""
 
+# Look up one label's outcome in a results file: "<status><TAB><signature>".
+lookup_result() {
+  awk -F'\t' -v want="$2" '$2 == want { print $1 "\t" $3; exit }' "$1"
+}
+
 while IFS=$'\t' read -r status step_label head_signature step_file; do
   [[ "$status" == "FAIL" ]] || continue
 
@@ -670,40 +682,54 @@ mismatches="$(sed '/^$/d' <<< "$mismatches")"
 new_failures=""
 
 if [[ -n "$mismatches" ]]; then
-  echo "Re-confirming $(wc -l <<< "$mismatches" | tr -d ' ') mismatch(es) before attributing them to this branch..."
+  echo "Re-confirming $(wc -l <<< "$mismatches" | tr -d ' ') mismatch(es) before attributing them to this branch."
+  echo "Re-running the whole matrix rather than the failing steps alone: several steps"
+  echo "create persistent objects, so replaying one in place would let it skip the very"
+  echo "create branch that failed and look transient."
 
-  # Round 1: does it still fail on head?
+  # Round 1: the full matrix again on head, from the same reset state the
+  # original pass started from.
+  reset_between_passes
+  install_kit "$REPO_ROOT" quiet
+  run_matrix "head re-check" "$WORK_DIR/head-recheck.txt"
+
   still_failing=""
   while IFS=$'\t' read -r step_label head_signature step_file base_signature; do
     [[ -n "$step_label" ]] || continue
-    if run_one_step "$step_file" "$WORK_DIR/recheck.log"; then
-      echo "  transient: '$step_label' passed on retry against this branch -- not a regression"
+    IFS=$'\t' read -r recheck_status recheck_signature < <(lookup_result "$WORK_DIR/head-recheck.txt" "$step_label")
+    if [[ "$recheck_status" == "PASS" ]]; then
+      echo "  transient: '$step_label' passed when the matrix was replayed -- not a regression"
     else
-      still_failing+="$step_label"$'\t'"$STEP_SIGNATURE"$'\t'"$step_file"$'\t'"$base_signature"$'\n'
+      still_failing+="$step_label"$'\t'"$recheck_signature"$'\t'"$step_file"$'\t'"$base_signature"$'\n'
     fi
   done <<< "$mismatches"
 
   still_failing="$(sed '/^$/d' <<< "$still_failing")"
 
-  # Round 2: reinstall base and see whether it fails there too, now.
+  # Round 2: the full matrix against base, same way.
   if [[ -n "$still_failing" && "$base_ran" -eq 1 ]]; then
-    echo "  reinstalling base to re-test $(wc -l <<< "$still_failing" | tr -d ' ') step(s) against it..."
+    echo "  replaying the matrix against base for $(wc -l <<< "$still_failing" | tr -d ' ') step(s)..."
+    reset_between_passes
     install_kit "$WORK_DIR/base" quiet
+    run_matrix "base re-check" "$WORK_DIR/base-recheck.txt"
 
     while IFS=$'\t' read -r step_label head_signature step_file base_signature; do
       [[ -n "$step_label" ]] || continue
-      if run_one_step "$step_file" "$WORK_DIR/recheck-base.log"; then
+      IFS=$'\t' read -r rebase_status rebase_signature < <(lookup_result "$WORK_DIR/base-recheck.txt" "$step_label")
+
+      if [[ "$rebase_status" == "PASS" ]]; then
         new_failures+="$step_label -- $head_signature"$'\n'
-      elif [[ "$STEP_SIGNATURE" == "$head_signature" ]] \
+      elif [[ "$rebase_signature" == "$head_signature" ]] \
            && [[ "$harness_unchanged" -eq 1 ]] \
            && step_unchanged_from_base "$step_label" "$step_file"; then
-        echo "  environmental: '$step_label' fails the same way on base when re-run -- not a regression"
-        pre_existing+="$step_label -- $head_signature (confirmed on re-run)"$'\n'
+        echo "  environmental: '$step_label' fails the same way on base when replayed -- not a regression"
+        pre_existing+="$step_label -- $head_signature (confirmed on replay)"$'\n'
       else
-        new_failures+="$step_label -- error changed: base [$STEP_SIGNATURE] head [$head_signature]"$'\n'
+        new_failures+="$step_label -- error changed: base [$rebase_signature] head [$head_signature]"$'\n'
       fi
     done <<< "$still_failing"
 
+    # Leave this branch's procedures installed, so the job ends as it began.
     install_kit "$REPO_ROOT" quiet
   elif [[ -n "$still_failing" ]]; then
     while IFS=$'\t' read -r step_label head_signature _ _; do

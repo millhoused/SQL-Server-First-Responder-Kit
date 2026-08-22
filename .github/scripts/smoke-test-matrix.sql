@@ -57,6 +57,24 @@ EXEC dbo.sp_Blitz
      @SkipChecksSchema   = 'dbo',
      @SkipChecksTable    = 'BlitzChecksToSkip';
 
+/*
+The exact configuration run-sql-server-smoke-tests.sh uses to capture findings
+for the base-vs-head comparison. That capture is guarded so a failure degrades
+the informational diff instead of killing the run -- which means an error unique
+to this combination would only ever be a warning. Running it here too puts it
+through the error classifier, where a new failure fails the build.
+*/
+--#STEP: sp_Blitz findings-capture configuration
+EXEC dbo.sp_Blitz
+     @CheckUserDatabaseObjects = 1,
+     @CheckServerInfo          = 1,
+     @OutputDatabaseName       = 'FRKSmokeTest',
+     @OutputSchemaName         = 'dbo',
+     @OutputTableName          = 'BlitzFindings',
+     @SkipChecksDatabase       = 'FRKSmokeTest',
+     @SkipChecksSchema         = 'dbo',
+     @SkipChecksTable          = 'BlitzChecksToSkip';
+
 --#STEP: sp_BlitzCache all sort orders
 EXEC dbo.sp_BlitzCache @SortOrder = 'all';
 
