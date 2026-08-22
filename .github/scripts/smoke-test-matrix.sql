@@ -75,6 +75,17 @@ EXEC dbo.sp_Blitz
      @SkipChecksSchema         = 'dbo',
      @SkipChecksTable          = 'BlitzChecksToSkip';
 
+/* The readback the comparison performs, so that renaming or removing CheckID,
+   DatabaseName or Finding fails this classified step instead of silently
+   downgrading the findings diff to "Skipped". The volatile-CheckID filter the
+   runner applies is deliberately not reproduced here -- this exists to prove the
+   columns the readback depends on, not to duplicate the filter. */
+SELECT CONVERT(VARCHAR(10), CheckID)
+       + '|' + ISNULL(DatabaseName, '(server)')
+       + '|' + ISNULL(Finding, '')
+FROM FRKSmokeTest.dbo.BlitzFindings
+ORDER BY CheckID, DatabaseName, Finding;
+
 --#STEP: sp_BlitzCache all sort orders
 EXEC dbo.sp_BlitzCache @SortOrder = 'all';
 
@@ -217,8 +228,14 @@ with a backslash, producing '/var/opt/mssql/data/\\FRKSmokeTest_Full2.bak'.
 
 Tracked in issue #4049. A permanently-failing step is worse than an absent one:
 it trains everyone to expect red and it advertises coverage that does not exist.
-So this stays at @Help until #4049 lands, at which point the invocation below
-should be uncommented.
+So this stays at @Help until #4049 lands.
+
+Re-enabling takes TWO changes, not one. Uncommenting the invocation below on its
+own will fail immediately on sp_DatabaseRestore's CommandExecute prerequisite
+check: the workflow no longer fetches Ola Hallengren's CommandLog and
+CommandExecute, because with only @Help left nothing could reach them. Restore
+the workflow's dependency step (its URL and both SHA-256 hashes are preserved in
+a comment there) and this invocation together.
 
     EXEC dbo.sp_DatabaseRestore
          @Database            = 'FRKSmokeTest',
