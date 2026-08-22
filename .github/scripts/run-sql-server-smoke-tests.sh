@@ -410,12 +410,17 @@ WHERE name IN (N'BlitzOutput', N'BlitzCache', N'BlitzFirst', N'BlitzFirst_FileSt
    views in place, so the head pass would skip all four view-creation paths. */
 DECLARE @dropview NVARCHAR(MAX) = N'';
 
-SELECT @dropview = @dropview + N'DROP VIEW FRKSmokeTest.dbo.' + QUOTENAME(name) + N';'
+/* DROP VIEW rejects a three-part name -- 'DROP VIEW' does not allow specifying
+   the database name as a prefix (Msg 166), unlike DROP TABLE, which accepts one.
+   So the statement is built with two-part names and executed inside the target
+   database via its own sp_executesql. */
+SELECT @dropview = @dropview + N'DROP VIEW dbo.' + QUOTENAME(name) + N';'
 FROM FRKSmokeTest.sys.views
 WHERE name IN (N'BlitzFirst_FileStats_Deltas', N'BlitzFirst_PerfmonStats_Deltas',
-               N'BlitzFirst_PerfmonStats_Actuals', N'BlitzFirst_WaitStats_Deltas');
+               N'BlitzFirst_PerfmonStats_Actuals', N'BlitzFirst_WaitStats_Deltas')
+  AND SCHEMA_NAME(schema_id) = N'dbo';
 
-IF @dropview <> N'' EXEC sys.sp_executesql @dropview;
+IF @dropview <> N'' EXEC FRKSmokeTest.sys.sp_executesql @dropview;
 IF @drop <> N'' EXEC sys.sp_executesql @drop;
 
 /* sp_BlitzLock creates synonyms when logging to a table. */
