@@ -264,13 +264,19 @@ IF OBJECT_ID('FRKSmokeTest.dbo.BlitzFindings') IS NOT NULL
     DROP TABLE FRKSmokeTest.dbo.BlitzFindings;
 " >/dev/null
 
+  # Carries the same skip list as the matrix steps. Without it the CheckID 106
+  # trace-file race (issue #4050) could abort this run instead, which would kill
+  # the whole script rather than one labelled step.
   run_query "
 EXEC dbo.sp_Blitz
      @CheckUserDatabaseObjects = 1,
      @CheckServerInfo          = 1,
      @OutputDatabaseName       = 'FRKSmokeTest',
      @OutputSchemaName         = 'dbo',
-     @OutputTableName          = 'BlitzFindings';
+     @OutputTableName          = 'BlitzFindings',
+     @SkipChecksDatabase       = 'FRKSmokeTest',
+     @SkipChecksSchema         = 'dbo',
+     @SkipChecksTable          = 'BlitzChecksToSkip';
 " >/dev/null
 
   "$SQLCMD" "${SQLCMD_ARGS[@]}" -d FRKSmokeTest -h -1 -W -s '|' -Q "

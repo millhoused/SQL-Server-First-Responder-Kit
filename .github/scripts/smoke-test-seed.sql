@@ -137,5 +137,35 @@ BACKUP DATABASE FRKSmokeTest
     WITH INIT, FORMAT, NAME = 'FRKSmokeTest full 2';
 GO
 
+/* ---------------------------------------------------------------------------
+   Checks CI skips, and why.
+
+   CheckID 106 reads the live default trace with fn_trace_gettable. That file is
+   being written continuously -- more so here, because the smoke test itself does
+   constant DDL -- and a read that lands on a torn or rolling file raises Msg 568,
+   which aborts the whole sp_Blitz run rather than just that check. It fired on
+   one of six sp_Blitz calls in a single CI run, which would mean red builds on
+   pull requests that changed nothing. Tracked in issue #4050; remove this row
+   once that is fixed.
+
+   Feeding it through @SkipChecksTable rather than hard-coding an exclusion has a
+   side benefit: the skip-checks code path is itself exercised on every run.
+   --------------------------------------------------------------------------- */
+IF OBJECT_ID('FRKSmokeTest.dbo.BlitzChecksToSkip') IS NOT NULL
+    DROP TABLE FRKSmokeTest.dbo.BlitzChecksToSkip;
+GO
+
+CREATE TABLE FRKSmokeTest.dbo.BlitzChecksToSkip
+(
+    DatabaseName NVARCHAR(128) NULL,
+    CheckID      INT           NULL,
+    ServerName   NVARCHAR(128) NULL
+);
+GO
+
+INSERT FRKSmokeTest.dbo.BlitzChecksToSkip (DatabaseName, CheckID, ServerName)
+VALUES (NULL, 106, NULL);  /* issue #4050 */
+GO
+
 PRINT 'Seed complete.';
 GO

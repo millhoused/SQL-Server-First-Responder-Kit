@@ -21,22 +21,41 @@ Deliberately excluded:
 */
 
 --#STEP: sp_Blitz default
-EXEC dbo.sp_Blitz;
+EXEC dbo.sp_Blitz
+     @SkipChecksDatabase = 'FRKSmokeTest',
+     @SkipChecksSchema   = 'dbo',
+     @SkipChecksTable    = 'BlitzChecksToSkip';
 
 --#STEP: sp_Blitz full check
-EXEC dbo.sp_Blitz @CheckUserDatabaseObjects = 1, @CheckServerInfo = 1;
+EXEC dbo.sp_Blitz
+     @CheckUserDatabaseObjects = 1,
+     @CheckServerInfo          = 1,
+     @SkipChecksDatabase = 'FRKSmokeTest',
+     @SkipChecksSchema   = 'dbo',
+     @SkipChecksTable    = 'BlitzChecksToSkip';
 
 --#STEP: sp_Blitz markdown output
-EXEC dbo.sp_Blitz @OutputType = 'MARKDOWN';
+EXEC dbo.sp_Blitz
+     @OutputType = 'MARKDOWN',
+     @SkipChecksDatabase = 'FRKSmokeTest',
+     @SkipChecksSchema   = 'dbo',
+     @SkipChecksTable    = 'BlitzChecksToSkip';
 
 --#STEP: sp_Blitz count output
-EXEC dbo.sp_Blitz @OutputType = 'COUNT';
+EXEC dbo.sp_Blitz
+     @OutputType = 'COUNT',
+     @SkipChecksDatabase = 'FRKSmokeTest',
+     @SkipChecksSchema   = 'dbo',
+     @SkipChecksTable    = 'BlitzChecksToSkip';
 
 --#STEP: sp_Blitz to table
 EXEC dbo.sp_Blitz
      @OutputDatabaseName = 'FRKSmokeTest',
      @OutputSchemaName   = 'dbo',
-     @OutputTableName    = 'BlitzOutput';
+     @OutputTableName    = 'BlitzOutput',
+     @SkipChecksDatabase = 'FRKSmokeTest',
+     @SkipChecksSchema   = 'dbo',
+     @SkipChecksTable    = 'BlitzChecksToSkip';
 
 --#STEP: sp_BlitzCache all sort orders
 EXEC dbo.sp_BlitzCache @SortOrder = 'all';
@@ -170,6 +189,13 @@ EXEC dbo.sp_DatabaseRestore @Help = 1;
 /*
 Requires Ola Hallengren's dbo.CommandExecute, which sp_DatabaseRestore refuses to
 run without. CI installs it into master before this runs; see the workflow.
+
+KNOWN FAILING on Linux: @MoveFiles defaults to 1, and that path splits the
+filename off PhysicalName with a hardcoded backslash, so on a forward-slash path
+CHARINDEX returns 0 and LEFT(..., -1) raises Msg 537. Tracked in issue #4049.
+Left in deliberately: it fails identically on base and head, so the comparison
+classifies it as pre-existing and it does not fail the build. It turns green on
+its own once #4049 is fixed.
 */
 --#STEP: sp_DatabaseRestore restore from seeded backups
 EXEC dbo.sp_DatabaseRestore
