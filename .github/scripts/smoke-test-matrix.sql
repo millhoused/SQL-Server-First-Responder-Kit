@@ -227,9 +227,13 @@ EXEC dbo.sp_DatabaseRestore @Help = 1;
 /*
 sp_DatabaseRestore's execute path is NOT covered here, and deliberately so.
 
-Its dependencies are installed (CommandLog + CommandExecute, fetched by the
-workflow), so the procedure runs -- but it cannot complete against a Linux
-fixture. @MoveFiles defaults to 1, and that path handles paths with a hardcoded
+Its dependencies (Ola Hallengren's CommandLog + CommandExecute) are deliberately
+NOT installed either -- see the re-enabling note below. They were, briefly, and
+that is how the bug underneath was found: with both present the procedure runs
+far enough to fail against a Linux fixture rather than stopping at the
+missing-dependency check.
+
+@MoveFiles defaults to 1, and that path handles paths with a hardcoded
 backslash in two places: it splits the filename off PhysicalName with
 CHARINDEX('\\', ...), which returns 0 on a forward-slash path and makes
 LEFT(..., -1) raise Msg 537; and it joins the backup directory to the file name
