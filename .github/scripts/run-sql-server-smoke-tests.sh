@@ -28,6 +28,7 @@ trap 'rm -rf "$WORK_DIR"' EXIT
 
 SEED_SQL="$SCRIPT_DIR/smoke-test-seed.sql"
 MATRIX_SQL="$SCRIPT_DIR/smoke-test-matrix.sql"
+MATRIX_REL_PATH=".github/scripts/smoke-test-matrix.sql"
 
 # Every non-deprecated script in the kit. sp_BlitzUpdate is deliberately absent:
 # it rewrites the procs mid-run, which would invalidate every later step and the
@@ -207,6 +208,32 @@ error_signature() {
     || true
 }
 
+# ---------------------------------------------------------------------------
+# Is this step byte-identical to the one base runs under the same label?
+#
+# Both passes execute THIS branch's matrix, so a step the PR adds or edits runs
+# against base's procedures too. A defect in the step itself -- a typo'd
+# procedure name, a bad parameter -- therefore fails identically on both passes
+# and would be waved through as "pre-existing". Only a step base also has, with
+# the same body, may be grandfathered; anything new or edited has to pass on its
+# own merits.
+# ---------------------------------------------------------------------------
+step_unchanged_from_base() {
+  local label="$1" head_file="$2" base_label_file
+
+  [[ -d "$WORK_DIR/base-steps" ]] || return 1
+
+  for base_label_file in "$WORK_DIR/base-steps"/*.label; do
+    [[ -e "$base_label_file" ]] || return 1
+    if [[ "$(cat "$base_label_file")" == "$label" ]]; then
+      cmp -s "${base_label_file%.label}.sql" "$head_file" && return 0
+      return 1
+    fi
+  done
+
+  return 1
+}
+
 # Run one step file. Sets STEP_SIGNATURE; returns non-zero if the step failed.
 STEP_SIGNATURE=""
 run_one_step() {
@@ -223,11 +250,12 @@ run_one_step() {
 
 split_matrix() {
   local steps_dir="$1"
+  local matrix_file="${2:-$MATRIX_SQL}"
 
   rm -rf "$steps_dir"
   mkdir -p "$steps_dir"
 
-  python3 - "$MATRIX_SQL" "$steps_dir" <<'PYTHON'
+  python3 - "$matrix_file" "$steps_dir" <<'PYTHON'
 import os
 import sys
 
@@ -363,6 +391,18 @@ WHERE name IN (N'BlitzOutput', N'BlitzCache', N'BlitzFirst', N'BlitzFirst_FileSt
                N'BlitzFirst_WaitStats_Categories', N'BlitzWho',
                N'BlitzWho_Results', N'BlitzLock', N'BlitzIndex', N'BlitzFindings');
 
+/* sp_BlitzFirst's logging path also creates views alongside each table:
+   <FileStats>_Deltas, <PerfmonStats>_Deltas, <PerfmonStats>_Actuals and
+   <WaitStats>_Deltas. Dropping only the tables would leave the base pass's
+   views in place, so the head pass would skip all four view-creation paths. */
+DECLARE @dropview NVARCHAR(MAX) = N'';
+
+SELECT @dropview = @dropview + N'DROP VIEW FRKSmokeTest.dbo.' + QUOTENAME(name) + N';'
+FROM FRKSmokeTest.sys.views
+WHERE name IN (N'BlitzFirst_FileStats_Deltas', N'BlitzFirst_PerfmonStats_Deltas',
+               N'BlitzFirst_PerfmonStats_Actuals', N'BlitzFirst_WaitStats_Deltas');
+
+IF @dropview <> N'' EXEC sys.sp_executesql @dropview;
 IF @drop <> N'' EXEC sys.sp_executesql @drop;
 
 /* sp_BlitzLock creates synonyms when logging to a table. */
@@ -414,6 +454,17 @@ base_ran=0
 if [[ -n "$BASE_REVISION" ]] && git -C "$REPO_ROOT" rev-parse --verify --quiet "$BASE_REVISION" >/dev/null; then
   echo
   echo "=== Pass 1: base ($BASE_REVISION) ==="
+
+  # Base's own copy of the matrix, so we can tell which steps this PR added or
+  # edited. Those must pass on their own merits -- see step_unchanged_from_base.
+  if git -C "$REPO_ROOT" cat-file -e "$BASE_REVISION:$MATRIX_REL_PATH" 2>/dev/null; then
+    git -C "$REPO_ROOT" show "$BASE_REVISION:$MATRIX_REL_PATH" > "$WORK_DIR/base-matrix.sql"
+    split_matrix "$WORK_DIR/base-steps" "$WORK_DIR/base-matrix.sql"
+    echo "  base matrix: $(find "$WORK_DIR/base-steps" -name '*.sql' | wc -l | tr -d ' ') step(s) to compare against"
+  else
+    echo "  base has no matrix file; every step counts as new and must pass on its own"
+  fi
+
   materialise_kit "$BASE_REVISION" "$WORK_DIR/base"
   install_kit "$WORK_DIR/base"
   run_matrix "base" "$WORK_DIR/base-results.txt"
@@ -495,7 +546,8 @@ while IFS=$'\t' read -r status step_label head_signature step_file; do
   base_signature="$(awk -F'\t' -v want="$step_label" \
     '$1 == "FAIL" && $2 == want { print $3; exit }' "$WORK_DIR/base-results.txt")"
 
-  if [[ -n "$base_signature" && "$base_signature" == "$head_signature" ]]; then
+  if [[ -n "$base_signature" && "$base_signature" == "$head_signature" ]] \
+     && step_unchanged_from_base "$step_label" "$step_file"; then
     pre_existing+="$step_label -- $head_signature"$'\n'
   else
     mismatches+="$step_label"$'\t'"$head_signature"$'\t'"$step_file"$'\t'"$base_signature"$'\n'
@@ -530,7 +582,8 @@ if [[ -n "$mismatches" ]]; then
       [[ -n "$step_label" ]] || continue
       if run_one_step "$step_file" "$WORK_DIR/recheck-base.log"; then
         new_failures+="$step_label -- $head_signature"$'\n'
-      elif [[ "$STEP_SIGNATURE" == "$head_signature" ]]; then
+      elif [[ "$STEP_SIGNATURE" == "$head_signature" ]] \
+           && step_unchanged_from_base "$step_label" "$step_file"; then
         echo "  environmental: '$step_label' fails the same way on base when re-run -- not a regression"
         pre_existing+="$step_label -- $head_signature (confirmed on re-run)"$'\n'
       else
