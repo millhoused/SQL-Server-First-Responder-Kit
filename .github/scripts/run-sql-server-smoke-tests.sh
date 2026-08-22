@@ -452,12 +452,18 @@ EXEC dbo.sp_Blitz
     return 1
   }
 
-  # -y 0 and -w 65535 matter: this output is parsed, not read. sqlcmd defaults to
-  # an 80-character screen width and truncates variable-length columns at 256,
-  # while a row here reaches ~340 (CheckID + NVARCHAR(128) DatabaseName +
-  # VARCHAR(200) Finding). Wrapped or clipped rows would make sort/comm compare
-  # fragments and quietly miss real differences.
-  "$SQLCMD" "${SQLCMD_ARGS[@]}" -d FRKSmokeTest -h -1 -W -y 0 -w 65535 -s '|' -Q "
+  # This output is parsed, not read. sqlcmd defaults to an 80-character screen
+  # width and truncates variable-length columns at 256, while a row here reaches
+  # ~340 (CheckID + NVARCHAR(128) DatabaseName + VARCHAR(200) Finding), so rows
+  # could wrap or clip and sort/comm would compare fragments.
+  #
+  # 8000 for both rather than the "unlimited" spellings (-y 0, -w 65535): those
+  # are edge values whose handling varies between sqlcmd builds, and the first
+  # attempt at this fix used them and made the readback fail outright -- which,
+  # because this path only warns, showed up as a silently skipped comparison on
+  # a green build. 8000 is comfortably above the real maximum and is squarely
+  # inside the documented range for both flags.
+  "$SQLCMD" "${SQLCMD_ARGS[@]}" -d FRKSmokeTest -h -1 -W -y 8000 -w 8000 -s '|' -Q "
 SET NOCOUNT ON;
 SELECT CONVERT(VARCHAR(10), CheckID)
        + '|' + ISNULL(DatabaseName, '(server)')
@@ -465,7 +471,11 @@ SELECT CONVERT(VARCHAR(10), CheckID)
 FROM dbo.BlitzFindings
 WHERE CheckID NOT IN ($VOLATILE_CHECK_IDS)
 ORDER BY CheckID, DatabaseName, Finding;
-" 2>/dev/null | sed '/^$/d;/rows affected/d' | sort -u > "$destination" || return 1
+" 2>"$WORK_DIR/readback.log" | sed '/^$/d;/rows affected/d' | sort -u > "$destination" || {
+    echo "  ::warning::Reading findings back failed; the findings comparison will be skipped."
+    sed 's/^/    /' "$WORK_DIR/readback.log" | tail -10
+    return 1
+  }
 }
 
 # ---------------------------------------------------------------------------
