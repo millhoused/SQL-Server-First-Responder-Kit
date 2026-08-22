@@ -59,19 +59,22 @@ CREATE TABLE dbo.CommentsHeap
 );
 GO
 
+/* CHECKSUM(NEWID()) can return -2147483648, and ABS() of INT_MIN overflows --
+   which would abort the seed, and with it the whole job, at random. Widening to
+   BIGINT before ABS keeps that from turning CI flaky. */
 INSERT dbo.Users (DisplayName, Reputation, CreationDate)
 SELECT TOP (2000)
        LEFT(CONVERT(NVARCHAR(40), NEWID()), 20),
-       ABS(CHECKSUM(NEWID())) % 50000,
-       DATEADD(DAY, -(ABS(CHECKSUM(NEWID())) % 3000), GETDATE())
+       ABS(CAST(CHECKSUM(NEWID()) AS BIGINT)) % 50000,
+       DATEADD(DAY, -(ABS(CAST(CHECKSUM(NEWID()) AS BIGINT)) % 3000), GETDATE())
 FROM sys.all_objects a
 CROSS JOIN sys.all_objects b;
 
 INSERT dbo.Posts (OwnerUserId, Score, CreationDate, Title)
 SELECT TOP (5000)
-       ABS(CHECKSUM(NEWID())) % 2000 + 1,
-       ABS(CHECKSUM(NEWID())) % 100,
-       DATEADD(DAY, -(ABS(CHECKSUM(NEWID())) % 1000), GETDATE()),
+       ABS(CAST(CHECKSUM(NEWID()) AS BIGINT)) % 2000 + 1,
+       ABS(CAST(CHECKSUM(NEWID()) AS BIGINT)) % 100,
+       DATEADD(DAY, -(ABS(CAST(CHECKSUM(NEWID()) AS BIGINT)) % 1000), GETDATE()),
        LEFT(CONVERT(NVARCHAR(250), NEWID()), 50)
 FROM sys.all_objects a
 CROSS JOIN sys.all_objects b;

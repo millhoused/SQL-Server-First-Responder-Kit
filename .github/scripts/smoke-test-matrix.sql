@@ -204,12 +204,21 @@ EXEC dbo.sp_kill @ExecuteKills = 'N';
 EXEC dbo.sp_kill @ExecuteKills = 'N', @OrderBy = 'duration';
 
 /*
-Exercises the kill code path -- building and executing the KILL statements --
-with a filter that matches no session, so CI never kills its own connection.
-Killing a real session would need a second connection held open alongside this
-one; worth adding, but out of scope for the first pass.
+NOT coverage of the kill loop, despite running with @ExecuteKills = 'Y'.
+
+With a filter that matches no session, sp_kill sets @TotalKills to 0 and leaves
+through its "nothing to kill" branch; the cursor and EXEC(@KillSQL) at
+sp_kill.sql:793-840 are never reached. What this does cover is parameter
+handling and the filter/report path under the executing flag, without CI killing
+its own connection.
+
+Real coverage needs a second session held open for sp_kill to kill, respawned
+for every matrix run since the first one consumes it. Tracked in issue #4051.
+Labelled for what it is rather than what it looks like -- a step whose name
+implies coverage it does not provide is the same trap as the @VersionCheckMode
+call this whole harness replaced.
 */
---#STEP: sp_kill execute path with no matching session
+--#STEP: sp_kill executing flag with no matching session (not the kill loop)
 EXEC dbo.sp_kill @ExecuteKills = 'Y', @AppName = 'NoSuchApp-FRKSmokeTest';
 
 --#STEP: sp_DatabaseRestore help

@@ -452,7 +452,12 @@ EXEC dbo.sp_Blitz
     return 1
   }
 
-  "$SQLCMD" "${SQLCMD_ARGS[@]}" -d FRKSmokeTest -h -1 -W -s '|' -Q "
+  # -y 0 and -w 65535 matter: this output is parsed, not read. sqlcmd defaults to
+  # an 80-character screen width and truncates variable-length columns at 256,
+  # while a row here reaches ~340 (CheckID + NVARCHAR(128) DatabaseName +
+  # VARCHAR(200) Finding). Wrapped or clipped rows would make sort/comm compare
+  # fragments and quietly miss real differences.
+  "$SQLCMD" "${SQLCMD_ARGS[@]}" -d FRKSmokeTest -h -1 -W -y 0 -w 65535 -s '|' -Q "
 SET NOCOUNT ON;
 SELECT CONVERT(VARCHAR(10), CheckID)
        + '|' + ISNULL(DatabaseName, '(server)')
