@@ -329,14 +329,24 @@ run_matrix() {
 # ---------------------------------------------------------------------------
 VOLATILE_CHECK_IDS="156"
 
+# Returns non-zero, without aborting the job, when sp_Blitz cannot produce a
+# findings set. This runs the same full configuration the matrix just exercised,
+# so if sp_Blitz is failing -- including failing on base, before this branch is
+# involved at all -- this call fails too. Under `sqlcmd -b` and `set -e` that
+# would kill the run here, before the head pass, and the comparison logic that
+# exists to classify exactly that failure would never be reached. The findings
+# diff is informational, so losing it is survivable; losing the error
+# classification is not.
 capture_findings() {
   local destination="$1"
+
+  : > "$destination"
 
   run_query "
 SET NOCOUNT ON;
 IF OBJECT_ID('FRKSmokeTest.dbo.BlitzFindings') IS NOT NULL
     DROP TABLE FRKSmokeTest.dbo.BlitzFindings;
-" >/dev/null
+" >/dev/null 2>&1 || true
 
   # Carries the same skip list as the matrix steps. Without it the CheckID 106
   # trace-file race (issue #4050) could abort this run instead, which would kill
@@ -351,7 +361,10 @@ EXEC dbo.sp_Blitz
      @SkipChecksDatabase       = 'FRKSmokeTest',
      @SkipChecksSchema         = 'dbo',
      @SkipChecksTable          = 'BlitzChecksToSkip';
-" >/dev/null
+" >/dev/null 2>&1 || {
+    echo "  ::warning::sp_Blitz failed while capturing findings; the findings comparison will be skipped."
+    return 1
+  }
 
   "$SQLCMD" "${SQLCMD_ARGS[@]}" -d FRKSmokeTest -h -1 -W -s '|' -Q "
 SET NOCOUNT ON;
@@ -361,7 +374,7 @@ SELECT CONVERT(VARCHAR(10), CheckID)
 FROM dbo.BlitzFindings
 WHERE CheckID NOT IN ($VOLATILE_CHECK_IDS)
 ORDER BY CheckID, DatabaseName, Finding;
-" | sed '/^$/d;/rows affected/d' | sort -u > "$destination"
+" 2>/dev/null | sed '/^$/d;/rows affected/d' | sort -u > "$destination" || return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -451,6 +464,8 @@ if [[ -z "$BASE_REVISION" && -n "${GITHUB_BASE_REF:-}" ]]; then
 fi
 
 base_ran=0
+base_findings_ok=0
+head_findings_ok=0
 if [[ -n "$BASE_REVISION" ]] && git -C "$REPO_ROOT" rev-parse --verify --quiet "$BASE_REVISION" >/dev/null; then
   echo
   echo "=== Pass 1: base ($BASE_REVISION) ==="
@@ -468,7 +483,8 @@ if [[ -n "$BASE_REVISION" ]] && git -C "$REPO_ROOT" rev-parse --verify --quiet "
   materialise_kit "$BASE_REVISION" "$WORK_DIR/base"
   install_kit "$WORK_DIR/base"
   run_matrix "base" "$WORK_DIR/base-results.txt"
-  capture_findings "$WORK_DIR/base-findings.txt"
+  base_findings_ok=1
+  capture_findings "$WORK_DIR/base-findings.txt" || base_findings_ok=0
   reset_between_passes
   base_ran=1
 else
@@ -483,14 +499,15 @@ echo
 echo "=== Pass 2: this branch ==="
 install_kit "$REPO_ROOT"
 run_matrix "head" "$WORK_DIR/head-results.txt"
-capture_findings "$WORK_DIR/head-findings.txt"
+head_findings_ok=1
+capture_findings "$WORK_DIR/head-findings.txt" || head_findings_ok=0
 
 # ---------------------------------------------------------------------------
 # Report: findings differences are informational
 # ---------------------------------------------------------------------------
 echo
 echo "=== sp_Blitz findings: base vs this branch ==="
-if [[ "$base_ran" -eq 1 ]]; then
+if [[ "$base_ran" -eq 1 && "$base_findings_ok" -eq 1 && "$head_findings_ok" -eq 1 ]]; then
   added="$(comm -13 "$WORK_DIR/base-findings.txt" "$WORK_DIR/head-findings.txt" || true)"
   removed="$(comm -23 "$WORK_DIR/base-findings.txt" "$WORK_DIR/head-findings.txt" || true)"
 
@@ -516,8 +533,17 @@ if [[ "$base_ran" -eq 1 ]]; then
       [[ -n "$added" ]] && { echo; echo "**Newly reported:**"; echo '```'; echo "$added"; echo '```'; }
     } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
   fi
-else
+elif [[ "$base_ran" -ne 1 ]]; then
   echo "Skipped (no base pass)."
+else
+  if [[ "$base_findings_ok" -ne 1 && "$head_findings_ok" -ne 1 ]]; then
+    echo "Skipped: sp_Blitz could not produce a findings set on either revision."
+  elif [[ "$base_findings_ok" -ne 1 ]]; then
+    echo "Skipped: sp_Blitz could not produce a findings set on base."
+  else
+    echo "Skipped: sp_Blitz could not produce a findings set on this branch."
+  fi
+  echo "The error classification below is unaffected."
 fi
 
 # ---------------------------------------------------------------------------
