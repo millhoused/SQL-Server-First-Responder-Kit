@@ -457,13 +457,15 @@ EXEC dbo.sp_Blitz
   # ~340 (CheckID + NVARCHAR(128) DatabaseName + VARCHAR(200) Finding), so rows
   # could wrap or clip and sort/comm would compare fragments.
   #
-  # 8000 for both rather than the "unlimited" spellings (-y 0, -w 65535): those
-  # are edge values whose handling varies between sqlcmd builds, and the first
-  # attempt at this fix used them and made the readback fail outright -- which,
-  # because this path only warns, showed up as a silently skipped comparison on
-  # a green build. 8000 is comfortably above the real maximum and is squarely
-  # inside the documented range for both flags.
-  "$SQLCMD" "${SQLCMD_ARGS[@]}" -d FRKSmokeTest -h -1 -W -y 8000 -w 8000 -s '|' -Q "
+  # No -W here: sqlcmd rejects it alongside -y ("The y and the W options are
+  # mutually exclusive"), and -y is the one that lifts the truncation. Without
+  # -W the columns come back padded to the display width, so the trailing space
+  # is stripped in the pipeline below instead.
+  #
+  # 8000 rather than the "unlimited" spellings (-y 0, -w 65535) -- those are
+  # edge values whose handling varies by build, and 8000 is comfortably above
+  # the real maximum while squarely inside the documented range for both.
+  "$SQLCMD" "${SQLCMD_ARGS[@]}" -d FRKSmokeTest -h -1 -y 8000 -w 8000 -s '|' -Q "
 SET NOCOUNT ON;
 SELECT CONVERT(VARCHAR(10), CheckID)
        + '|' + ISNULL(DatabaseName, '(server)')
@@ -471,7 +473,9 @@ SELECT CONVERT(VARCHAR(10), CheckID)
 FROM dbo.BlitzFindings
 WHERE CheckID NOT IN ($VOLATILE_CHECK_IDS)
 ORDER BY CheckID, DatabaseName, Finding;
-" 2>"$WORK_DIR/readback.log" | sed '/^$/d;/rows affected/d' | sort -u > "$destination" || {
+" 2>"$WORK_DIR/readback.log" \
+    | sed -e 's/[[:space:]]*$//' -e '/^$/d' -e '/rows affected/d' \
+    | sort -u > "$destination" || {
     echo "  ::warning::Reading findings back failed; the findings comparison will be skipped."
     sed 's/^/    /' "$WORK_DIR/readback.log" | tail -10
     return 1
