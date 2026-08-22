@@ -13,23 +13,40 @@ permissions:
 
 jobs:
   smoke-tests:
-    name: Install and smoke test First Responder Kit
+    # Oldest supported and newest available. SQL Server 2016 left extended
+    # support on 2026-07-14, which makes 2017 the oldest version worth testing;
+    # 2025 is the current release. Both run to completion even if one fails, so
+    # a version-specific break is obvious.
+    name: ${{ matrix.label }}
     runs-on: ubuntu-22.04
-    timeout-minutes: 20
+    timeout-minutes: 45
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: mcr.microsoft.com/mssql/server:2017-latest
+            label: SQL Server 2017 (oldest supported)
+          - image: mcr.microsoft.com/mssql/server:2025-latest
+            label: SQL Server 2025 (newest)
 
     env:
       SQLCMDSERVER: tcp:127.0.0.1,1433
       SQLCMDUSER: sa
       SQLCMDPASSWORD: Testing-Only-Passw0rd!
+      MSSQL_IMAGE: ${{ matrix.image }}
       GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
       GITHUB_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
 
     services:
       sqlserver:
-        image: mcr.microsoft.com/mssql/server:2022-latest
+        image: ${{ matrix.image }}
         env:
           ACCEPT_EULA: Y
           MSSQL_PID: Developer
+          # 2017 images read SA_PASSWORD; later images read MSSQL_SA_PASSWORD.
+          # Setting both keeps one service definition working across the matrix.
+          SA_PASSWORD: Testing-Only-Passw0rd!
           MSSQL_SA_PASSWORD: Testing-Only-Passw0rd!
         ports:
           - 1433:1433
@@ -38,6 +55,8 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v5
         with:
+          # Full history: the run installs the base branch's copy of every
+          # script to compare against, which needs the base commit present.
           fetch-depth: 0
 
       - name: Install sqlcmd
